@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+build/
+dist/
+dist_build/
+app_stdout.log
+app_stderr.log
+crash_log.txt
+config.json
+*.mp4
+*.mov
+*.avi
+*.mkv
