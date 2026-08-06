@@ -187,6 +187,25 @@ now a single clean video+audio stream again, matching normal camera-recorded vid
 reintroduce attached-pic cover embedding without first confirming (on a real Instagram upload) that it
 doesn't break thumbnail generation.
 
+## Cover via reordering, not embedding
+
+Instagram/TikTok/Facebook/YouTube Shorts all generate their own auto-thumbnail from the actual video
+content (typically the very first frame) during upload — none of them read any file-embedded cover/poster
+metadata, and setting a custom cover automatically via each platform's API is out of scope for a local
+desktop tool (YouTube Shorts doesn't even support a custom thumbnail via API at all). Many source clips
+open on a dark/dim frame, which is what was actually producing bad-looking covers on the platforms (a
+separate issue from the attached-pic bug above).
+
+Fix: `ProcessadorVideo._reordenar_para_capa()` (called from `_executar_ffmpeg()`, export path only — not
+preview/thumbnail/player, which still show the original chronological order for editing purposes)
+reorders the final export to start at the video's midpoint and appends the original 0→midpoint segment at
+the end, via an ffmpeg `split`/`trim`/`concat` filter graph (video and, if present, audio identically, to
+stay in sync). This preserves 100% of the content — nothing is cut — it just changes playback order, so
+whatever frame a platform grabs automatically as the "start" is already representative instead of a dark
+cold-open. Skipped for clips shorter than `DURACAO_MINIMA_REORDENAR` (3s) where a midpoint split doesn't
+make sense, and fails gracefully (falls back to the original, non-reordered video) if the probe/ffmpeg
+step errors — never blocks the export.
+
 ## Windows-specific export safety
 
 `_executar_ffmpeg()` writes to a temp filename (`<stem>_tmp<suffix>`) in the output folder and only renames

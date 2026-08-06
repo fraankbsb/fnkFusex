@@ -185,57 +185,141 @@ class ProcessadorVideo:
         self.is_processing = False
         self.callback_fim(sucessos, total)
 
+    def _obter_duracao_video(self, video_path):
+        cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+               "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)]
+        try:
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     universal_newlines=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            return float(result.stdout.strip())
+        except Exception:
+            return None
+
+    def _video_tem_audio(self, video_path):
+        cmd = ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index",
+               "-of", "csv=p=0", str(video_path)]
+        try:
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     universal_newlines=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            return bool(result.stdout.strip())
+        except Exception:
+            return False
+
+    # Duração mínima pra valer a pena reordenar — vídeos muito curtos têm "meio" perto
+    # demais do início/fim, e o corte fica sem sentido.
+    DURACAO_MINIMA_REORDENAR = 3.0
+
+    def _reordenar_para_capa(self, input_video):
+        """Instagram/TikTok/Facebook/YouTube Shorts sempre geram a própria miniatura a
+        partir do COMEÇO do vídeo (nenhuma capa embutida no arquivo é lida por elas — já
+        tentamos e quebrou o thumbnail do Instagram). Muitos vídeos de origem começam
+        numa cena escura, então em vez de embutir uma capa, reordena o vídeo pra começar
+        no meio do clipe e emendar o começo original no final — preserva 100% do
+        conteúdo, só muda a ordem, garantindo que o frame que as plataformas pegam
+        automaticamente já seja um frame bom. Retorna o Path do vídeo reordenado (arquivo
+        temporário, chamador é responsável por apagar) ou None se não foi possível
+        (nesse caso o chamador deve seguir com o vídeo original sem reordenar)."""
+        duracao = self._obter_duracao_video(input_video)
+        if not duracao or duracao < self.DURACAO_MINIMA_REORDENAR:
+            return None
+        meio = duracao / 2.0
+        tem_audio = self._video_tem_audio(input_video)
+
+        saida = Path(os.environ.get("TEMP", "C:/Windows/Temp")) / f"reordenado_{Path(input_video).stem}_{os.getpid()}.mp4"
+
+        filtro_v = (
+            f"[0:v]split[vpre][vpost];"
+            f"[vpre]trim=start=0:end={meio},setpts=PTS-STARTPTS[va];"
+            f"[vpost]trim=start={meio},setpts=PTS-STARTPTS[vb];"
+            f"[vb][va]concat=n=2:v=1:a=0[outv]"
+        )
+        cmd = ["ffmpeg", "-y", "-i", str(input_video)]
+        if tem_audio:
+            filtro_a = (
+                f"[0:a]asplit[apre][apost];"
+                f"[apre]atrim=start=0:end={meio},asetpts=PTS-STARTPTS[aa];"
+                f"[apost]atrim=start={meio},asetpts=PTS-STARTPTS[ab];"
+                f"[ab][aa]concat=n=2:v=0:a=1[outa]"
+            )
+            cmd.extend(["-filter_complex", f"{filtro_v};{filtro_a}", "-map", "[outv]", "-map", "[outa]",
+                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                        "-c:a", "aac", "-b:a", "192k"])
+        else:
+            cmd.extend(["-filter_complex", filtro_v, "-map", "[outv]", "-an",
+                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18"])
+        cmd.append(str(saida))
+
+        resultado = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    universal_newlines=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        if resultado.returncode == 0 and saida.exists() and saida.stat().st_size > 0:
+            return saida
+        saida.unlink(missing_ok=True)
+        return None
+
     def _executar_ffmpeg(self, input_video, template_path, output_path, configs, video_config=None, extra_args=None):
         out_w, out_h = get_res_dimensions(configs['resolucao'])
-        filtros_str, last_out = build_filter_complex(str(input_video), template_path, configs, video_config, out_w, out_h)
-        
-        cmd = ["ffmpeg", "-y"]
-        cmd.extend(["-i", str(input_video)])
-        
-        if template_path and Path(template_path).exists():
-            cmd.extend(["-i", str(template_path)])
-            
-        cmd.extend([
-            "-filter_complex", filtros_str,
-            "-map", last_out
-        ])
-        
         is_thumb = bool(extra_args and "-vframes" in extra_args)
-        # Quando a pasta de saída é igual à de entrada (mesmo nome de arquivo), gravar
-        # direto no destino final faz o ffmpeg ler e escrever o mesmo arquivo ao mesmo
-        # tempo, o que no Windows pode falhar (arquivo em uso) mesmo já tendo gerado o
-        # vídeo — grava-se num arquivo temporário e só then renomeia por cima do destino.
-        destino_final = Path(output_path)
-        destino_gravacao = destino_final.with_name(f"{destino_final.stem}_tmp{destino_final.suffix}") if not is_thumb else destino_final
 
-        if is_thumb:
-            cmd.extend(extra_args)
-            cmd.extend(["-update", "1"])
-            cmd.append(str(destino_gravacao))
-        else:
-            cmd.extend(["-map", "0:a?"])
-            if configs['audio_melhorado']:
-                cmd.extend(["-c:a", "aac", "-b:a", "192k", "-af", "highpass=f=200,lowpass=f=3000"])
+        # Só reordena na exportação final — preview/player/thumbnail da grade continuam
+        # mostrando o vídeo na ordem original, pra não confundir quem está posicionando
+        # marca d'água/frases olhando a linha do tempo real.
+        video_reordenado = None
+        video_para_processar = input_video
+        if not is_thumb:
+            video_reordenado = self._reordenar_para_capa(input_video)
+            if video_reordenado:
+                video_para_processar = video_reordenado
+
+        try:
+            filtros_str, last_out = build_filter_complex(str(video_para_processar), template_path, configs, video_config, out_w, out_h)
+
+            cmd = ["ffmpeg", "-y", "-i", str(video_para_processar)]
+            if template_path and Path(template_path).exists():
+                cmd.extend(["-i", str(template_path)])
+
+            cmd.extend([
+                "-filter_complex", filtros_str,
+                "-map", last_out
+            ])
+
+            # Quando a pasta de saída é igual à de entrada (mesmo nome de arquivo), gravar
+            # direto no destino final faz o ffmpeg ler e escrever o mesmo arquivo ao mesmo
+            # tempo, o que no Windows pode falhar (arquivo em uso) mesmo já tendo gerado o
+            # vídeo — grava-se num arquivo temporário e só depois renomeia por cima do destino.
+            destino_final = Path(output_path)
+            destino_gravacao = destino_final.with_name(f"{destino_final.stem}_tmp{destino_final.suffix}") if not is_thumb else destino_final
+
+            if is_thumb:
+                cmd.extend(extra_args)
+                cmd.extend(["-update", "1"])
+                cmd.append(str(destino_gravacao))
             else:
-                cmd.extend(["-c:a", "aac", "-b:a", "128k"])
+                cmd.extend(["-map", "0:a?"])
+                if configs['audio_melhorado']:
+                    cmd.extend(["-c:a", "aac", "-b:a", "192k", "-af", "highpass=f=200,lowpass=f=3000"])
+                else:
+                    cmd.extend(["-c:a", "aac", "-b:a", "128k"])
 
-            # Limita as threads do encoder em vez de deixar o ffmpeg usar 100% de todos os
-            # núcleos de uma vez — em máquinas com refrigeração fraca isso pode causar
-            # superaquecimento/instabilidade e travar o PC inteiro durante exportações longas.
-            threads_ffmpeg = max(2, (os.cpu_count() or 4) // 2)
-            cmd.extend(["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-threads", str(threads_ffmpeg)])
-            if configs['anti_dup']:
-                cmd.extend(["-r", "30.01", "-map_metadata", "-1"])
-            cmd.append(str(destino_gravacao))
+                # Limita as threads do encoder em vez de deixar o ffmpeg usar 100% de todos os
+                # núcleos de uma vez — em máquinas com refrigeração fraca isso pode causar
+                # superaquecimento/instabilidade e travar o PC inteiro durante exportações longas.
+                threads_ffmpeg = max(2, (os.cpu_count() or 4) // 2)
+                cmd.extend(["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-threads", str(threads_ffmpeg)])
+                if configs['anti_dup']:
+                    cmd.extend(["-r", "30.01", "-map_metadata", "-1"])
+                cmd.append(str(destino_gravacao))
 
-        process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, creationflags=subprocess.CREATE_NO_WINDOW)
-        if process.returncode != 0:
-            if destino_gravacao != destino_final and destino_gravacao.exists():
-                destino_gravacao.unlink(missing_ok=True)
-            raise Exception(process.stderr)
+            process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            if process.returncode != 0:
+                if destino_gravacao != destino_final and destino_gravacao.exists():
+                    destino_gravacao.unlink(missing_ok=True)
+                raise Exception(process.stderr)
 
-        if destino_gravacao != destino_final:
-            destino_gravacao.replace(destino_final)
+            if destino_gravacao != destino_final:
+                destino_gravacao.replace(destino_final)
+        finally:
+            if video_reordenado:
+                video_reordenado.unlink(missing_ok=True)
 
 
 class EditorAutomaDarkApp(ctk.CTk):
