@@ -171,7 +171,6 @@ class ProcessadorVideo:
             template_video = template_por_video.get(str(video), "")
             try:
                 self._executar_ffmpeg(video, template_video, output_path, configs, video_config)
-                self._gerar_capa(output_path)
                 sucessos += 1
             except Exception as e:
                 import tkinter.messagebox
@@ -237,44 +236,6 @@ class ProcessadorVideo:
 
         if destino_gravacao != destino_final:
             destino_gravacao.replace(destino_final)
-
-    def _gerar_capa(self, output_path):
-        """Extrai um frame do meio do vídeo final exportado e anexa como capa (thumbnail)
-        dentro do próprio arquivo de vídeo (stream de imagem com disposition=attached_pic),
-        sem gerar um .jpg separado — assim o vídeo já sai com a estética de capa bonita
-        para redes sociais e players que exibem o thumbnail embutido."""
-        capa_tmp = None
-        output_tmp = None
-        try:
-            cmd_dur = ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                       "-of", "default=noprint_wrappers=1:nokey=1", str(output_path)]
-            result = subprocess.run(cmd_dur, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                     universal_newlines=True, creationflags=subprocess.CREATE_NO_WINDOW)
-            duracao = float(result.stdout.strip())
-            meio = duracao / 2.0
-
-            capa_tmp = Path(output_path).with_name(f"{Path(output_path).stem}_capa_tmp.jpg")
-            cmd_capa = ["ffmpeg", "-y", "-ss", str(meio), "-i", str(output_path),
-                        "-vframes", "1", "-update", "1", "-q:v", "2", str(capa_tmp)]
-            subprocess.run(cmd_capa, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            creationflags=subprocess.CREATE_NO_WINDOW)
-
-            output_tmp = Path(output_path).with_name(f"{Path(output_path).stem}_muxtmp{Path(output_path).suffix}")
-            cmd_mux = ["ffmpeg", "-y", "-i", str(output_path), "-i", str(capa_tmp),
-                       "-map", "0", "-map", "1",
-                       "-c", "copy", "-c:v:1", "mjpeg", "-disposition:v:1", "attached_pic",
-                       str(output_tmp)]
-            result_mux = subprocess.run(cmd_mux, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                         creationflags=subprocess.CREATE_NO_WINDOW)
-            if result_mux.returncode == 0 and output_tmp.exists() and output_tmp.stat().st_size > 0:
-                output_tmp.replace(output_path)
-        except Exception:
-            pass
-        finally:
-            if capa_tmp and capa_tmp.exists():
-                capa_tmp.unlink(missing_ok=True)
-            if output_tmp and output_tmp.exists():
-                output_tmp.unlink(missing_ok=True)
 
 
 class EditorAutomaDarkApp(ctk.CTk):

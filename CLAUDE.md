@@ -176,10 +176,16 @@ match, not the first — early frames (fade-ins, black intros) can report invali
 would otherwise crash ffmpeg. `build_filter_complex()` also defensively discards any stored crop with
 zero width/height as a second line of defense for old `config.json` entries.
 
-## Cover (thumbnail) embedding
+## No embedded cover (attached-pic) — removed on purpose
 
-`ProcessadorVideo._gerar_capa()` embeds a cover image as an attached-pic mjpeg stream directly inside the
-exported `.mp4` (no separate `_capa.jpg` file), extracting a frame from the middle of the video.
+`ProcessadorVideo` used to have a `_gerar_capa()` step that embedded a cover image as an attached-pic
+mjpeg stream inside the exported `.mp4` (extracted from the middle of the video). **Removed** — Instagram
+doesn't read that embedded metadata anyway, and worse, the resulting file has two video streams (the real
+h264 one plus the mjpeg attached-pic), which appears to confuse Instagram's own thumbnail generation:
+videos exported with this enabled showed up as solid black tiles in the profile grid. Exported files are
+now a single clean video+audio stream again, matching normal camera-recorded video structure. Don't
+reintroduce attached-pic cover embedding without first confirming (on a real Instagram upload) that it
+doesn't break thumbnail generation.
 
 ## Windows-specific export safety
 
