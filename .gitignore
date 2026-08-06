@@ -17,3 +17,4 @@ config.json
 # Release pelo publish.py, igual ao sistema do fnkDownloader.
 *.exe
 payload_v*.zip
+launcher_setup.zip

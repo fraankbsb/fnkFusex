@@ -5,6 +5,7 @@ if sys.stderr is None:
     sys.stderr = open(os.devnull, 'w')
 import os
 import json
+import shutil
 import threading
 import subprocess
 import time
@@ -481,17 +482,20 @@ class EditorAutomaDarkApp(ctk.CTk):
 
         f_menu_topo = ctk.CTkFrame(self.painel_esq, fg_color="transparent")
         f_menu_topo.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
-        ctk.CTkLabel(f_menu_topo, text="fnkTemplater", font=ctk.CTkFont(size=13, weight="bold"), wraplength=140).pack(pady=(0, 5))
-        btn_style = {"fg_color": "#383a40", "hover_color": "#474a51", "text_color": "white", "height": 28, "corner_radius": 6, "font": ctk.CTkFont(size=11)}
+        f_marca = ctk.CTkFrame(f_menu_topo, fg_color="transparent")
+        f_marca.pack(pady=(0, 5))
+        ctk.CTkLabel(f_marca, text="fnk", font=ctk.CTkFont(size=13, weight="bold"), text_color="#2ecc71").pack(side="left")
+        ctk.CTkLabel(f_marca, text="Templater", font=ctk.CTkFont(size=13, weight="bold"), text_color="white").pack(side="left")
+        btn_style = {"fg_color": "#383a40", "hover_color": "#474a51", "text_color": "white", "height": 28, "corner_radius": 8, "font": ctk.CTkFont(size=11)}
         ctk.CTkButton(f_menu_topo, text="📥 Enviar Vídeos", command=self.selecionar_entrada, **btn_style).pack(fill="x", pady=3)
         self.btn_template = ctk.CTkButton(f_menu_topo, text="🖼️ Template", command=self.selecionar_template, **btn_style)
         self.btn_template.pack(fill="x", pady=3)
-        self.btn_processar = ctk.CTkButton(f_menu_topo, text="▶ PROCESSAR", command=self.iniciar_processamento, fg_color="#2ecc71", hover_color="#27ae60", text_color="white", height=34, corner_radius=6, font=ctk.CTkFont(weight="bold", size=11))
+        self.btn_processar = ctk.CTkButton(f_menu_topo, text="▶ PROCESSAR", command=self.iniciar_processamento, fg_color="#2ecc71", hover_color="#27ae60", text_color="white", height=34, corner_radius=8, font=ctk.CTkFont(weight="bold", size=11))
         self.btn_processar.pack(fill="x", pady=(10, 3))
         ctk.CTkButton(f_menu_topo, text="📁 Abrir Saída", command=self.selecionar_saida, **btn_style).pack(fill="x", pady=3)
         ctk.CTkButton(f_menu_topo, text="🗑️ Excluir Todos", command=self.excluir_todos_videos,
                       fg_color="#e74c3c", hover_color="#c0392b", text_color="white", height=28,
-                      corner_radius=6, font=ctk.CTkFont(size=11)).pack(fill="x", pady=3)
+                      corner_radius=8, font=ctk.CTkFont(size=11)).pack(fill="x", pady=3)
         self.lbl_contador_esq = ctk.CTkLabel(f_menu_topo, text="📥 0 vídeo(s)", anchor="w", font=ctk.CTkFont(size=10), wraplength=140)
         self.lbl_contador_esq.pack(fill="x", pady=(8, 0))
 
@@ -891,16 +895,23 @@ class EditorAutomaDarkApp(ctk.CTk):
         # ClipChamp, que sempre parte de uma seleção existente em vez de um retângulo vazio.
         cfg_atual = self.configs_individuais.get(v_str, {})
         crop_salvo = cfg_atual.get('crop')
+        sel_inicial = (0, 0, disp_w, disp_h)
         if crop_salvo:
             try:
                 cw, ch, cx, cy = (int(p) for p in crop_salvo.split(':'))
                 escala_x0 = disp_w / real_w
                 escala_y0 = disp_h / real_h
-                sel_inicial = (cx * escala_x0, cy * escala_y0, (cx + cw) * escala_x0, (cy + ch) * escala_y0)
+                # Clampa dentro do canvas — um crop salvo pra outro vídeo com resolução
+                # diferente (ex: copiado via "Aplicar a todos") pode cair fora dos limites
+                # e deixar alças inacessíveis (fora da área visível/arrastável).
+                sx0 = max(0, min(disp_w, cx * escala_x0))
+                sy0 = max(0, min(disp_h, cy * escala_y0))
+                sx1 = max(0, min(disp_w, (cx + cw) * escala_x0))
+                sy1 = max(0, min(disp_h, (cy + ch) * escala_y0))
+                if sx1 - sx0 >= 20 and sy1 - sy0 >= 20:
+                    sel_inicial = (sx0, sy0, sx1, sy1)
             except Exception:
-                sel_inicial = (0, 0, disp_w, disp_h)
-        else:
-            sel_inicial = (0, 0, disp_w, disp_h)
+                pass
 
         sel = {"x0": sel_inicial[0], "y0": sel_inicial[1], "x1": sel_inicial[2], "y1": sel_inicial[3]}
         HANDLE_R = 6
@@ -1000,14 +1011,9 @@ class EditorAutomaDarkApp(ctk.CTk):
         f_btns = ctk.CTkFrame(dialog, fg_color="transparent")
         f_btns.pack(fill="x", padx=15, pady=(10, 15))
 
-        def _crop_string_da_selecao():
-            x0, x1 = sorted((sel["x0"], sel["x1"]))
-            y0, y1 = sorted((sel["y0"], sel["y1"]))
-            if x1 - x0 < 5 or y1 - y0 < 5:
-                messagebox.showwarning("Aviso", "A área selecionada é pequena demais.", parent=dialog)
-                return None
-            escala_x = real_w / disp_w
-            escala_y = real_h / disp_h
+        def _crop_string_para(vw, vh, x0, y0, x1, y1):
+            escala_x = vw / disp_w
+            escala_y = vh / disp_h
             rw = int((x1 - x0) * escala_x)
             rh = int((y1 - y0) * escala_y)
             rx = int(x0 * escala_x)
@@ -1015,23 +1021,56 @@ class EditorAutomaDarkApp(ctk.CTk):
             # ffmpeg exige dimensões pares
             rw -= rw % 2
             rh -= rh % 2
+            if rw <= 0 or rh <= 0:
+                return None
             return f"{rw}:{rh}:{rx}:{ry}"
 
+        def _crop_string_da_selecao():
+            x0, x1 = sorted((sel["x0"], sel["x1"]))
+            y0, y1 = sorted((sel["y0"], sel["y1"]))
+            if x1 - x0 < 5 or y1 - y0 < 5:
+                messagebox.showwarning("Aviso", "A área selecionada é pequena demais.", parent=dialog)
+                return None
+            return _crop_string_para(real_w, real_h, x0, y0, x1, y1)
+
         def aplicar(somente_este):
+            x0, x1 = sorted((sel["x0"], sel["x1"]))
+            y0, y1 = sorted((sel["y0"], sel["y1"]))
             crop_str = _crop_string_da_selecao()
             if not crop_str:
                 return
+            # Frações relativas (0..1) da seleção — usadas pra recalcular o corte em
+            # pixels absolutos corretos em cada vídeo "aplicar a todos", já que vídeos
+            # com resolução diferente do editado não podem usar os MESMOS pixels
+            # (cortaria uma área proporcionalmente errada do quadro, mesmo que dentro
+            # dos limites do vídeo).
+            frac_x0, frac_x1 = x0 / disp_w, x1 / disp_w
+            frac_y0, frac_y1 = y0 / disp_h, y1 / disp_h
+
             alvos = [video_path] if somente_este else list(self.videos_carregados)
+            aplicados = 0
             for v in alvos:
                 vs = str(v)
+                if vs == v_str:
+                    crop_v = crop_str
+                else:
+                    dims_v = self._obter_dimensoes_video(vs)
+                    if not dims_v:
+                        continue
+                    vw, vh = dims_v
+                    crop_v = _crop_string_para(vw, vh, frac_x0 * disp_w, frac_y0 * disp_h,
+                                                frac_x1 * disp_w, frac_y1 * disp_h)
+                if not crop_v:
+                    continue
                 cfg = self.configs_individuais.setdefault(vs, {'y': 682, 'x': 0, 'zoom': 1.0, 'crop': None})
-                cfg['crop'] = crop_str
+                cfg['crop'] = crop_v
                 self._gerar_thumb_card(vs, force_regenerate=True)
+                aplicados += 1
             if self.video_preview_selecionado and str(self.video_preview_selecionado) in [str(v) for v in alvos]:
                 self.gerar_preview_visual()
             self.salvar_config()
             dialog.destroy()
-            msg = "Corte aplicado a este vídeo!" if somente_este else f"Corte aplicado a {len(alvos)} vídeo(s)!"
+            msg = "Corte aplicado a este vídeo!" if somente_este else f"Corte aplicado a {aplicados} vídeo(s)!"
             messagebox.showinfo("Sucesso", msg)
 
         ctk.CTkButton(f_btns, text="✅ Somente este vídeo", fg_color="#3498db", hover_color="#2980b9",
@@ -1648,7 +1687,42 @@ class EditorAutomaDarkApp(ctk.CTk):
         self.btn_exportar_preview.configure(state="normal")
         messagebox.showinfo("Sucesso", f"Processados {sucessos} de {total} vídeos!")
 
+def _garantir_ffmpeg():
+    """Em PCs novos (so com o launcher, sem nada instalado), o ffmpeg pode nao
+    estar no PATH — tenta instalar sozinho via winget antes de abrir a UI, pra
+    o usuario nao precisar descobrir/instalar isso manualmente.
+    --source winget e explicito de proposito: o winget busca por padrao em
+    TODAS as fontes configuradas (inclusive msstore), e a fonte msstore falha
+    com erro de certificado (0x8a15005e) em varios PCs mesmo quando o pacote
+    so existe na fonte winget — sem o --source explicito a instalacao falha
+    silenciosamente nesses PCs."""
+    if shutil.which("ffmpeg"):
+        return
+    print("FFmpeg nao encontrado no PATH. Tentando instalar automaticamente via winget...")
+    cmd = ["winget", "install", "--id", "Gyan.FFmpeg", "-e",
+           "--source", "winget", "--silent",
+           "--accept-package-agreements", "--accept-source-agreements"]
+    try:
+        resultado = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
+                                    creationflags=subprocess.CREATE_NO_WINDOW)
+        if resultado.returncode == 0:
+            print("FFmpeg instalado com sucesso. Se o app nao encontrar o ffmpeg agora, reinicie-o "
+                  "(o PATH so e recarregado numa sessao nova).")
+        else:
+            # Loga o codigo de saida E a saida real do comando — sem isso, diagnosticar
+            # numa maquina sem acesso a terminal vira um vai-e-volta.
+            print(f"Falha ao instalar FFmpeg automaticamente (codigo {resultado.returncode}).")
+            print(f"stdout: {resultado.stdout.strip()}")
+            print(f"stderr: {resultado.stderr.strip()}")
+    except FileNotFoundError:
+        print("winget nao esta disponivel nesta maquina — instale o ffmpeg manualmente e "
+              "adicione ao PATH.")
+    except Exception as e:
+        print(f"Erro ao tentar instalar FFmpeg via winget: {e}")
+
+
 if __name__ == "__main__":
+    _garantir_ffmpeg()
     app = EditorAutomaDarkApp()
     app.mainloop()
 

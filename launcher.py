@@ -31,6 +31,11 @@ else:
 VERSION_FILE = APP_DIR / "version.json"
 CONFIG_FILE  = APP_DIR / "update_config.json"
 
+# Nome do proprio executavel do launcher (ex: "FusexLauncher.exe") — usado como
+# segunda camada de protecao ao extrair um update: nunca sobrescrever a si mesmo
+# enquanto esta rodando (o Windows bloqueia isso com PermissionError [Errno 13]).
+LAUNCHER_EXE_NOME = Path(sys.executable).name if getattr(sys, "frozen", False) else None
+
 USER_AGENT = "app-updater"
 
 
@@ -90,15 +95,37 @@ def verificar_update(log):
     return atual, remota, release
 
 
+def escolher_asset_payload(release):
+    """Uma release pode ter MAIS de um .zip anexado (o payload de codigo E o
+    launcher_setup.zip de instalacao inicial) — pegar "o primeiro .zip que
+    achar" e um bug real ja visto em producao: o launcher baixava o pacote
+    errado (launcher_setup.zip) e tentava sobrescrever o proprio .exe em
+    execucao, o que o Windows bloqueia (PermissionError: [Errno 13]).
+    O payload de codigo sempre comeca com "payload_" — so ele deve ser usado
+    para autoatualizar o app."""
+    assets = release.get("assets", [])
+    especifico = next(
+        (a for a in assets if a["name"].startswith("payload_") and a["name"].endswith(".zip")),
+        None,
+    )
+    if especifico:
+        return especifico
+    # Fallback defensivo (config antiga sem o prefixo "payload_") — ainda evita
+    # pegar o launcher_setup.zip por engano.
+    return next(
+        (a for a in assets if a["name"].endswith(".zip") and "launcher" not in a["name"].lower()),
+        None,
+    )
+
+
 def aplicar_update(release, log):
-    assets    = release.get("assets", [])
-    zip_asset = next((a for a in assets if a["name"].endswith(".zip")), None)
+    zip_asset = escolher_asset_payload(release)
     if not zip_asset:
-        raise RuntimeError("Release nao tem nenhum arquivo .zip anexado.")
+        raise RuntimeError("Release nao tem nenhum pacote de atualizacao (payload_*.zip) anexado.")
 
     with tempfile.TemporaryDirectory() as tmp:
         zip_path = Path(tmp) / "payload.zip"
-        log("Baixando atualizacao...")
+        log(f"Baixando atualizacao ({zip_asset['name']})...")
         req = urllib.request.Request(
             zip_asset["browser_download_url"],
             headers={"User-Agent": USER_AGENT},
@@ -113,10 +140,16 @@ def aplicar_update(release, log):
 
         log("Aplicando atualizacao...")
         for item in extract_dir.rglob("*"):
-            if item.is_file():
-                destino = APP_DIR / item.relative_to(extract_dir)
-                destino.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(item, destino)
+            if not item.is_file():
+                continue
+            # Segunda camada de protecao: nunca sobrescreve o proprio launcher em
+            # execucao, mesmo que ele venha (por engano) dentro do zip do payload.
+            if LAUNCHER_EXE_NOME and item.name == LAUNCHER_EXE_NOME:
+                log(f"Ignorando {item.name} do pacote (e o proprio launcher em execucao).")
+                continue
+            destino = APP_DIR / item.relative_to(extract_dir)
+            destino.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, destino)
 
 
 class LauncherApp:

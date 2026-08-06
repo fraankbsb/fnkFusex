@@ -61,29 +61,46 @@ Python instalado, so o launcher.
   embutido no launcher (embutir um token no `.exe` distribuido seria extraivel por qualquer um que tivesse
   o arquivo). Nao reverter pra privado sem resolver esse problema de autenticacao antes.
 - **`launcher.py`** → compilado em `FusexLauncher.exe` (PyInstaller `--onefile --windowed`). Tem 2 botoes:
-  "Atualizar App" (baixa a release mais recente do GitHub e sobrescreve o `Fusex.exe` local) e "Iniciar App"
-  (abre `Fusex.exe` direto via `subprocess.Popen`, sem precisar de python na maquina). So precisa
-  recompilar quando `launcher.py` MESMO muda — mudancas em `editor_automacao.py` nao exigem recompilar o
-  launcher, so publicar release normal (`publish.py`). Comando de build:
+  "Atualizar App" (consulta a release mais recente, baixa o asset `payload_*.zip` — nunca "o primeiro .zip
+  que achar", ver nota de bug abaixo — e sobrescreve o `Fusex.exe` local) e "Iniciar App" (abre `Fusex.exe`
+  direto via `subprocess.Popen`, sem precisar de python na maquina). So precisa recompilar quando
+  `launcher.py` MESMO muda — mudancas em `editor_automacao.py` nao exigem recompilar o launcher, so
+  publicar release normal (`publish.py`). Comando de build:
   `python -m PyInstaller --onefile --windowed --name FusexLauncher --distpath . --workpath build launcher.py`
-  — depois `rm -rf build FusexLauncher.spec` e reanexar o `.exe` + `update_config.json` na release mais
-  recente (nao sao republicados via `publish.py`, que so mexe no payload):
-  `gh release upload <tag> FusexLauncher.exe update_config.json --repo fraankbsb/fnkFusex --clobber`.
-  **Atencao:** isso precisa ser refeito a cada nova release — o asset fica preso na tag antiga, e a tag
-  "latest" muda a cada `publish.py`.
+  seguido de `rm -rf build FusexLauncher.spec`.
+  **Bug real ja corrigido:** uma release tem DOIS assets `.zip` (`payload_vX.Y.Z.zip` e
+  `launcher_setup.zip`, ver `publish.py` abaixo) — pegar "o primeiro .zip da lista" pode escolher o
+  `launcher_setup.zip` por engano e o launcher tenta sobrescrever o proprio `.exe` em execucao, o que o
+  Windows bloqueia (`PermissionError: [Errno 13]`). `escolher_asset_payload()` exige o prefixo `payload_`
+  no nome do asset, e `aplicar_update()` tem uma segunda camada de protecao: nunca extrai um arquivo cujo
+  nome bata com o do proprio `.exe` do launcher em execucao (`LAUNCHER_EXE_NOME`), nao importa o que vier
+  dentro do zip.
 - **`publish.py`** → roda no PC de edicao. Builda o `Fusex.exe` com `pyinstaller TemplaterFNK.spec`, sobe a
-  versao (patch +1) em `version.json`, da commit+push no repo (codigo-fonte, nunca o `.exe`), empacota
-  `Fusex.exe` + `version.json` num zip e publica como GitHub Release via `gh release create`.
-  Uso: `python publish.py auto` (versao/mensagem automaticas) ou `python publish.py 1.0.1 "mensagem"`.
+  versao (patch +1) em `version.json`, da commit+push no repo (codigo-fonte, nunca o `.exe` — se nao
+  houver nada novo alem da versao, o commit e pulado sem travar o script), empacota `Fusex.exe` +
+  `version.json` em `payload_vX.Y.Z.zip` e publica como GitHub Release via `gh release create`. Uso:
+  `python publish.py auto` (versao/mensagem automaticas) ou `python publish.py 1.0.1 "mensagem"`.
+  Tambem monta e publica, na MESMA release, um segundo asset de nome **fixo** (`launcher_setup.zip` =
+  `FusexLauncher.exe` + `update_config.json`, via `montar_launcher_setup()`) — isso cria um link
+  permanente `github.com/fraankbsb/fnkFusex/releases/latest/download/launcher_setup.zip` pra instalar em
+  PC novo do zero, sem precisar trocar link a cada versao (nao precisa mais reanexar manualmente o
+  launcher a cada release). Se `FusexLauncher.exe` nao existir na pasta (ainda nao foi compilado), esse
+  passo e pulado com aviso — o `payload_*.zip` do app sai normalmente.
 - **`watch_and_publish.py`** + **`iniciar_vigia.bat`** → vigia que fica monitorando `editor_automacao.py` e
   `TemplaterFNK.spec`; ao detectar mudanca salva, espera 8s de silencio e chama `publish.py auto` sozinho.
   Dar duplo-clique no `.bat` no inicio de uma sessao de edicao.
 - **`update_config.json`** → config do projeto: `repo` (`fraankbsb/fnkFusex`), `entry_point` (`Fusex.exe`),
   `app_title`, `payload_files` (`["Fusex.exe"]`). `version.json` guarda a versao local instalada.
-- `Fusex.exe` e `*.exe` em geral **nunca sao commitados no git** (`.gitignore`) — so existem localmente
-  (build) e como asset anexado nas GitHub Releases. Isso evita inchar o historico do repo a cada rebuild.
+- `Fusex.exe`, `FusexLauncher.exe` e `*.exe` em geral **nunca sao commitados no git** (`.gitignore`, junto
+  com `payload_v*.zip` e `launcher_setup.zip`) — so existem localmente (build) e como asset anexado nas
+  GitHub Releases. Isso evita inchar o historico do repo a cada rebuild.
 - Numeracao de versao so pode subir (nunca republicar com o mesmo numero ou menor, senao o launcher nao
   detecta a atualizacao).
+- `editor_automacao.py` tenta instalar o `ffmpeg` sozinho via `winget` (`_garantir_ffmpeg()`, chamada antes
+  de abrir a UI) se nao encontrar no PATH — util em PC novo que so tem o launcher. Sempre passa
+  `--source winget` explicito: sem isso o winget busca em todas as fontes por padrao (inclusive
+  `msstore`), que falha com erro de certificado (`0x8a15005e`) em varios PCs mesmo quando o pacote so
+  existe na fonte winget.
 
 ## Repo hygiene notes
 

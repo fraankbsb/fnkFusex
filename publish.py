@@ -20,11 +20,13 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
-APP_DIR      = Path(__file__).resolve().parent
-VERSION_FILE = APP_DIR / "version.json"
-CONFIG_FILE  = APP_DIR / "update_config.json"
-SPEC_FILE    = APP_DIR / "TemplaterFNK.spec"
-EXE_NOME     = "Fusex.exe"
+APP_DIR       = Path(__file__).resolve().parent
+VERSION_FILE  = APP_DIR / "version.json"
+CONFIG_FILE   = APP_DIR / "update_config.json"
+SPEC_FILE     = APP_DIR / "TemplaterFNK.spec"
+EXE_NOME      = "Fusex.exe"
+LAUNCHER_EXE  = "FusexLauncher.exe"
+LAUNCHER_ZIP  = "launcher_setup.zip"
 
 _CAMINHOS_GH_CONHECIDOS = [
     r"C:\Program Files\GitHub CLI\gh.exe",
@@ -99,9 +101,38 @@ def commitar_e_dar_push(mensagem):
     resultado = subprocess.run(
         ["git", "commit", "-m", mensagem], cwd=APP_DIR, capture_output=True, text=True
     )
-    if resultado.returncode != 0 and "nothing to commit" not in resultado.stdout:
-        print(f"  ⚠️  git commit: {resultado.stdout.strip()} {resultado.stderr.strip()}")
+    if resultado.returncode != 0:
+        if "nothing to commit" in resultado.stdout:
+            # Nada novo alem do version.json/republicacao — nao trava o script,
+            # so segue direto pro push/release.
+            print("  ℹ️  Nada novo pra commitar alem da versao, seguindo pro push/release.")
+        else:
+            print(f"  ⚠️  git commit: {resultado.stdout.strip()} {resultado.stderr.strip()}")
     subprocess.run(["git", "push"], cwd=APP_DIR)
+
+
+def montar_launcher_setup():
+    """Empacota o launcher ja compilado + update_config.json num zip de nome
+    FIXO (launcher_setup.zip), publicado em toda release. Isso cria um link
+    permanente (releases/latest/download/launcher_setup.zip) pra instalar o
+    app do zero num PC novo, sem precisar trocar o link a cada versao. O
+    FusexLauncher.exe em si so precisa ser recompilado se o launcher.py MESMO
+    mudar — aqui so reempacotamos o que ja existe na pasta."""
+    launcher_exe = APP_DIR / LAUNCHER_EXE
+    if not launcher_exe.exists():
+        print(f"  ⚠️  {LAUNCHER_EXE} nao encontrado — pulando o pacote de instalacao inicial "
+              f"({LAUNCHER_ZIP}). Compile uma vez com:\n"
+              f"      python -m PyInstaller --onefile --windowed --name FusexLauncher "
+              f"--distpath . --workpath build launcher.py")
+        return None
+    zip_path = APP_DIR / LAUNCHER_ZIP
+    if zip_path.exists():
+        zip_path.unlink()
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(launcher_exe, arcname=LAUNCHER_EXE)
+        zf.write(CONFIG_FILE, arcname=CONFIG_FILE.name)
+    print(f"  ✓  Pacote criado: {zip_path.name}")
+    return zip_path
 
 
 def main():
@@ -131,7 +162,8 @@ def main():
     # 3. Commit + push do codigo-fonte (mantem o repo em dia)
     commitar_e_dar_push(mensagem)
 
-    # 4. Monta o zip do payload
+    # 4. Monta o zip do payload (nome tem que comecar com "payload_" — e assim
+    # que o launcher reconhece qual dos .zips da release e o autoupdate).
     zip_path = APP_DIR / f"payload_v{nova_versao}.zip"
     if zip_path.exists():
         zip_path.unlink()
@@ -141,11 +173,17 @@ def main():
             zf.write(arquivo, arcname=arquivo.name)
     print(f"  ✓  Pacote criado: {zip_path.name}")
 
-    # 5. Cria a release no GitHub via gh CLI
+    # 4b. Monta o pacote de instalacao inicial (launcher_setup.zip, nome fixo)
+    launcher_zip_path = montar_launcher_setup()
+
+    # 5. Cria a release no GitHub via gh CLI, com os dois assets
     tag = f"v{nova_versao}"
+    arquivos_release = [str(zip_path)]
+    if launcher_zip_path:
+        arquivos_release.append(str(launcher_zip_path))
     cmd = [
         GH, "release", "create", tag,
-        str(zip_path),
+        *arquivos_release,
         "--repo", repo,
         "--title", tag,
         "--notes", mensagem,
@@ -154,9 +192,14 @@ def main():
     resultado = subprocess.run(cmd, cwd=APP_DIR)
 
     zip_path.unlink()
+    if launcher_zip_path:
+        launcher_zip_path.unlink()
 
     if resultado.returncode == 0:
         print(f"  ✅  Release {tag} publicada! O botao 'Atualizar App' ja vai encontrar essa versao.")
+        if launcher_zip_path:
+            print(f"  🔗  Link permanente de instalacao: "
+                  f"https://github.com/{repo}/releases/latest/download/{LAUNCHER_ZIP}")
     else:
         print("  ❌  Falha ao publicar a release. Veja o erro acima.")
         sys.exit(resultado.returncode)
