@@ -12,3 +12,8 @@ config.json
 *.mov
 *.avi
 *.mkv
+
+# Builds (.exe) nunca vão pro git — só são publicados como asset de GitHub
+# Release pelo publish.py, igual ao sistema do fnkDownloader.
+*.exe
+payload_v*.zip

@@ -8,8 +8,8 @@ from editor_automacao import ProcessadorVideo
 # integration check: it exercises the real ffmpeg pipeline end-to-end when the sample
 # assets happen to be present locally, and skips cleanly (rather than passing vacuously
 # or failing everywhere else) when they aren't.
-INPUT_VIDEO = Path(r"C:\Users\FRANK\Desktop\videos\codigo\siga_esse_mesmo_padrão_continencia_202607120943.mp4")
-TEMPLATE = Path(r"D:/TEMPLATES/CODIGODECONDUTABR/template_base.png")
+INPUT_VIDEO = Path(__file__).parent / "fixtures" / "siga_esse_mesmo_padrão_continencia_202607120943.mp4"
+TEMPLATE = Path(r"D:/fnkSocialMidia/fnkTemplates/Homens/CODIGODECONDUTABR/template_base.png")
 
 
 @pytest.mark.skipif(not INPUT_VIDEO.exists(), reason="sample input video not present on this machine")

@@ -32,7 +32,12 @@ THUMB_W, THUMB_H = 84, 102
 
 # Proporções de recorte disponíveis para o vídeo (largura/altura) — aplicadas somente
 # ao vídeo em si, o template/canvas de saída continua com suas próprias dimensões.
-ASPECT_RATIOS = {"1:1": 1.0, "4:5": 4 / 5}
+ASPECT_RATIOS = {"1:1": 1.0, "4:5": 4 / 5, "9:16": 9 / 16}
+
+# Posição vertical padrão do vídeo no canvas do template, por proporção escolhida —
+# todos os vídeos de uma mesma proporção entram sempre na mesma posição. O 9:16 deve
+# ocupar o template inteiro, então usa y=0 no modo "preencher" (cobre o canvas todo).
+POSICAO_Y_PADRAO_ASPECT = {"1:1": 738.3, "4:5": 520.9, "9:16": 0}
 
 def get_res_dimensions(res_str):
     if res_str == "2160p": return 2160, 3840
@@ -46,33 +51,63 @@ def build_filter_complex(input_video_str, template_path, configs, video_config, 
     mover_x = video_config['x'] if video_config else 0
     zoom = video_config['zoom'] if video_config else 1.0
     stretch_x = video_config.get('stretch_x', 1.0) if video_config else 1.0
-    crop_str = f"crop={video_config['crop']}," if (video_config and video_config.get('crop')) else ""
+    crop_valor = video_config.get('crop') if video_config else None
+    # Protege contra crops com largura/altura zerada salvos de detecções antigas
+    # instáveis (cropdetect no primeiro frame) — um crop assim trava o ffmpeg. Também usa
+    # min() para nunca deixar o crop maior que o frame real do vídeo: um crop calculado
+    # para um vídeo (ex: via "Aplicar a todos" na ferramenta de corte) pode não caber em
+    # outro vídeo com resolução diferente — sem isso o ffmpeg falhava com "Invalid too
+    # big or non positive size for width/height".
+    crop_str = ""
+    if crop_valor:
+        partes = crop_valor.split(':')
+        if len(partes) == 4:
+            try:
+                cw, ch, cx, cy = (int(p) for p in partes)
+                if cw > 0 and ch > 0:
+                    crop_str = f"crop=w='min({cw}\\,iw-{cx})':h='min({ch}\\,ih-{cy})':x={cx}:y={cy},"
+            except ValueError:
+                pass
 
-    # Proporção do vídeo (recorte centralizado — não afeta o canvas/template de saída)
-    aspect_crop_str = ""
-    ratio = ASPECT_RATIOS.get(configs.get('aspect_video'))
-    if ratio:
-        aspect_crop_str = f"crop=w='min(iw\\,ih*{ratio})':h='min(ih\\,iw/{ratio})',"
+    # Proporção/redimensionamento do vídeo (posicionamento no canvas do template — não
+    # recorta o vídeo em si) — configurado por vídeo individualmente, não globalmente.
+    # Os vídeos já chegam prontos (pré-cortados) na proporção escolhida (1:1, 4:5 ou
+    # 9:16), então aqui só posicionamos/escalamos o vídeo no canvas de saída, sem
+    # recortar a proporção de novo (isso causava zoom/corte indevido em vídeos que já
+    # estavam certos).
+    aspect_video = video_config.get('aspect_video') if video_config else None
+    aspect_modo = video_config.get('aspect_modo', 'ajustar') if video_config else 'ajustar'
+    ratio = ASPECT_RATIOS.get(aspect_video)
 
     # Escala base (aplica o zoom)
     base_w = int(out_w * zoom)
     base_w = base_w if base_w % 2 == 0 else base_w + 1
 
-    if configs.get('aspect_video') == 'Preencher':
-        # Encaixa a largura do vídeo exatamente nas laterais do template (out_w), mantendo
-        # a proporção original (altura calculada automaticamente) — sem esticar/distorcer
-        # e ignorando zoom/largura manual, para garantir preenchimento perfeito e sem gaps.
-        filtros.append(f"[0:v]{crop_str}{aspect_crop_str}scale={out_w}:-2[vid]")
+    if ratio and aspect_modo == 'preencher':
+        # Preencher (estilo "cover"): escala para cobrir o canvas inteiro e corta o
+        # excedente — sem sobrar barras/gaps.
+        filtros.append(
+            f"[0:v]{crop_str}"
+            f"scale=w='if(gte(a,{out_w}/{out_h}),-2,{out_w})':h='if(gte(a,{out_w}/{out_h}),{out_h},-2)',"
+            f"crop={out_w}:{out_h}[vid]"
+        )
+    elif ratio:
+        # Ajustar (estilo "contain"): mantém o vídeo inteiro visível dentro do canvas,
+        # podendo sobrar barras do template/cor de fundo nas laterais ou topo/base.
+        filtros.append(
+            f"[0:v]{crop_str}"
+            f"scale=w='if(gte(a,{out_w}/{out_h}),{out_w},-2)':h='if(gte(a,{out_w}/{out_h}),-2,{out_h})'[vid]"
+        )
     elif configs.get('esticar'):
         # Força a altura para preencher, e aplica stretch_x na largura
         scale_w = int(out_w * zoom * stretch_x)
         scale_w = scale_w if scale_w % 2 == 0 else scale_w + 1
         scale_h = int(out_h * zoom)
         scale_h = scale_h if scale_h % 2 == 0 else scale_h + 1
-        filtros.append(f"[0:v]{crop_str}{aspect_crop_str}scale={scale_w}:{scale_h}[vid]")
+        filtros.append(f"[0:v]{crop_str}scale={scale_w}:{scale_h}[vid]")
     else:
         # Mantém a proporção original na altura, mas estica a largura independentemente
-        filtros.append(f"[0:v]{crop_str}{aspect_crop_str}scale={base_w}:-2,scale=iw*{stretch_x}:ih[vid]")
+        filtros.append(f"[0:v]{crop_str}scale={base_w}:-2,scale=iw*{stretch_x}:ih[vid]")
         
     # Fundo / Template
     if template_path and Path(template_path).exists():
@@ -135,10 +170,17 @@ class ProcessadorVideo:
             template_video = template_por_video.get(str(video), "")
             try:
                 self._executar_ffmpeg(video, template_video, output_path, configs, video_config)
+                self._gerar_capa(output_path)
                 sucessos += 1
             except Exception as e:
                 import tkinter.messagebox
-                tkinter.messagebox.showerror("Erro de Processamento", f"Falha ao processar {video.name}:\n\n{str(e)}")
+                # O stderr do ffmpeg começa com um cabeçalho enorme de build (irrelevante) e
+                # só a mensagem de erro de verdade fica no final — a caixa de erro não tem
+                # scroll, então sem isso o cabeçalho inteiro escondia a causa real do erro.
+                erro_str = str(e).strip()
+                linhas = [l for l in erro_str.splitlines() if l.strip()]
+                erro_relevante = "\n".join(linhas[-15:]) if len(linhas) > 15 else erro_str
+                tkinter.messagebox.showerror("Erro de Processamento", f"Falha ao processar {video.name}:\n\n{erro_relevante}")
         self.callback_progresso("Processamento Concluído!", 1.0)
         self.is_processing = False
         self.callback_fim(sucessos, total)
@@ -158,25 +200,80 @@ class ProcessadorVideo:
             "-map", last_out
         ])
         
-        if extra_args and "-vframes" in extra_args:
+        is_thumb = bool(extra_args and "-vframes" in extra_args)
+        # Quando a pasta de saída é igual à de entrada (mesmo nome de arquivo), gravar
+        # direto no destino final faz o ffmpeg ler e escrever o mesmo arquivo ao mesmo
+        # tempo, o que no Windows pode falhar (arquivo em uso) mesmo já tendo gerado o
+        # vídeo — grava-se num arquivo temporário e só then renomeia por cima do destino.
+        destino_final = Path(output_path)
+        destino_gravacao = destino_final.with_name(f"{destino_final.stem}_tmp{destino_final.suffix}") if not is_thumb else destino_final
+
+        if is_thumb:
             cmd.extend(extra_args)
             cmd.extend(["-update", "1"])
-            cmd.append(str(output_path))
+            cmd.append(str(destino_gravacao))
         else:
             cmd.extend(["-map", "0:a?"])
             if configs['audio_melhorado']:
                 cmd.extend(["-c:a", "aac", "-b:a", "192k", "-af", "highpass=f=200,lowpass=f=3000"])
             else:
                 cmd.extend(["-c:a", "aac", "-b:a", "128k"])
-                
-            cmd.extend(["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"])
+
+            # Limita as threads do encoder em vez de deixar o ffmpeg usar 100% de todos os
+            # núcleos de uma vez — em máquinas com refrigeração fraca isso pode causar
+            # superaquecimento/instabilidade e travar o PC inteiro durante exportações longas.
+            threads_ffmpeg = max(2, (os.cpu_count() or 4) // 2)
+            cmd.extend(["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-threads", str(threads_ffmpeg)])
             if configs['anti_dup']:
                 cmd.extend(["-r", "30.01", "-map_metadata", "-1"])
-            cmd.append(str(output_path))
-        
+            cmd.append(str(destino_gravacao))
+
         process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, creationflags=subprocess.CREATE_NO_WINDOW)
         if process.returncode != 0:
+            if destino_gravacao != destino_final and destino_gravacao.exists():
+                destino_gravacao.unlink(missing_ok=True)
             raise Exception(process.stderr)
+
+        if destino_gravacao != destino_final:
+            destino_gravacao.replace(destino_final)
+
+    def _gerar_capa(self, output_path):
+        """Extrai um frame do meio do vídeo final exportado e anexa como capa (thumbnail)
+        dentro do próprio arquivo de vídeo (stream de imagem com disposition=attached_pic),
+        sem gerar um .jpg separado — assim o vídeo já sai com a estética de capa bonita
+        para redes sociais e players que exibem o thumbnail embutido."""
+        capa_tmp = None
+        output_tmp = None
+        try:
+            cmd_dur = ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                       "-of", "default=noprint_wrappers=1:nokey=1", str(output_path)]
+            result = subprocess.run(cmd_dur, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     universal_newlines=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            duracao = float(result.stdout.strip())
+            meio = duracao / 2.0
+
+            capa_tmp = Path(output_path).with_name(f"{Path(output_path).stem}_capa_tmp.jpg")
+            cmd_capa = ["ffmpeg", "-y", "-ss", str(meio), "-i", str(output_path),
+                        "-vframes", "1", "-update", "1", "-q:v", "2", str(capa_tmp)]
+            subprocess.run(cmd_capa, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            creationflags=subprocess.CREATE_NO_WINDOW)
+
+            output_tmp = Path(output_path).with_name(f"{Path(output_path).stem}_muxtmp{Path(output_path).suffix}")
+            cmd_mux = ["ffmpeg", "-y", "-i", str(output_path), "-i", str(capa_tmp),
+                       "-map", "0", "-map", "1",
+                       "-c", "copy", "-c:v:1", "mjpeg", "-disposition:v:1", "attached_pic",
+                       str(output_tmp)]
+            result_mux = subprocess.run(cmd_mux, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                         creationflags=subprocess.CREATE_NO_WINDOW)
+            if result_mux.returncode == 0 and output_tmp.exists() and output_tmp.stat().st_size > 0:
+                output_tmp.replace(output_path)
+        except Exception:
+            pass
+        finally:
+            if capa_tmp and capa_tmp.exists():
+                capa_tmp.unlink(missing_ok=True)
+            if output_tmp and output_tmp.exists():
+                output_tmp.unlink(missing_ok=True)
 
 
 class EditorAutomaDarkApp(ctk.CTk):
@@ -184,7 +281,10 @@ class EditorAutomaDarkApp(ctk.CTk):
         super().__init__()
         self.title("fnkTemplater")
         self.geometry("1600x900")
-        self.state("zoomed")
+        # CTk aplica sua própria geometria logo após a criação da janela, o que pode
+        # sobrescrever state("zoomed") se chamado cedo demais — adiar via after() garante
+        # que a maximização aconteça depois disso, sempre abrindo em tela cheia.
+        self.after(10, lambda: self.state("zoomed"))
         self.configure(fg_color="#2b2d31")
         try:
             self.iconbitmap(resource_path("app_icon.ico"))
@@ -217,15 +317,131 @@ class EditorAutomaDarkApp(ctk.CTk):
         
         self.motor = ProcessadorVideo(self.atualizar_progresso, self.finalizar_processamento)
         self._construir_interface()
+        self._restaurar_area_edicao()
         self.bind("<Delete>", self.deletar_video_selecionado)
         
-    def _ao_mudar_aspect_video(self):
-        """A proporção afeta só o recorte do vídeo (o template/canvas de saída não muda)."""
-        self.salvar_config()
+    def _restaurar_area_edicao(self):
+        """Repopula a UI (grade de miniaturas, abas, botão de template) com o estado
+        salvo automaticamente da última sessão (vídeos, ajustes individuais e templates)."""
+        if self.templates_carregados:
+            if len(self.templates_carregados) == 1:
+                self.btn_template.configure(text=f"Template: {self.templates_carregados[0].name}")
+            else:
+                self.btn_template.configure(text=f"Templates: {len(self.templates_carregados)} (1 por vídeo, na ordem)")
+            self._atualizar_cor_play_btn()
         if self.videos_carregados:
+            self.lbl_contador_esq.configure(text=f"📥 {len(self.videos_carregados)} vídeo(s) adicionados")
+            self.atualizar_abas()
             self.renderizar_grid()
+
+    def _aplicar_posicao_padrao_aspect(self, cfg, valor):
+        """Aplica a posição vertical padrão (mesma para todos os vídeos da mesma
+        proporção). O 9:16 deve ocupar o template inteiro, então força o modo
+        'preencher' (cover) além de zerar x/y."""
+        y_padrao = POSICAO_Y_PADRAO_ASPECT.get(valor)
+        if y_padrao is None:
+            return
+        cfg['y'] = y_padrao
+        cfg['x'] = 0
+        if valor == "9:16":
+            cfg['aspect_modo'] = 'preencher'
+
+    def _ao_mudar_aspect_video(self):
+        """A proporção/redimensionamento escolhido afeta só o recorte do vídeo (o
+        template/canvas de saída não muda) e é aplicado apenas ao vídeo atualmente
+        selecionado na área de edição — para aplicar a todos, usar o botão
+        'Aplicar a todos os vídeos'."""
+        if not self.video_preview_selecionado:
+            messagebox.showwarning("Aviso", "Selecione um vídeo na área de edição primeiro.")
+            return
+        v_str = str(self.video_preview_selecionado)
+        cfg = self.configs_individuais.setdefault(v_str, {'y': 682, 'x': 0, 'zoom': 1.0, 'crop': None})
+        valor = self.var_aspect_video.get()
+        cfg['aspect_video'] = valor
+        self._aplicar_posicao_padrao_aspect(cfg, valor)
+        if cfg.get('aspect_modo') == 'preencher':
+            self.var_aspect_modo.set('Preencher')
+        self._gerar_thumb_card(v_str, force_regenerate=True)
+        self.gerar_preview_visual()
+        self.salvar_config()
+
+    def _ao_mudar_aspect_modo(self, valor=None):
+        """Alterna entre 'Preencher' (cobre o canvas inteiro, cortando o excedente) e
+        'Ajustar' (mantém o vídeo inteiro visível, podendo sobrar barras)."""
+        if not self.video_preview_selecionado:
+            messagebox.showwarning("Aviso", "Selecione um vídeo na área de edição primeiro.")
+            return
+        v_str = str(self.video_preview_selecionado)
+        cfg = self.configs_individuais.setdefault(v_str, {'y': 682, 'x': 0, 'zoom': 1.0, 'crop': None})
+        cfg['aspect_modo'] = 'preencher' if self.var_aspect_modo.get() == 'Preencher' else 'ajustar'
+        self._gerar_thumb_card(v_str, force_regenerate=True)
+        self.gerar_preview_visual()
+        self.salvar_config()
+
+    def aplicar_aspect_video_todos(self):
+        """Aplica o redimensionamento/proporção, o modo de corte (Preencher/Ajustar) E o
+        posicionamento (x, y, zoom) do vídeo atualmente selecionado a todos os demais
+        vídeos carregados na área de edição."""
+        if not self.videos_carregados:
+            return
+        valor = self.var_aspect_video.get()
+        modo = 'preencher' if self.var_aspect_modo.get() == 'Preencher' else 'ajustar'
+        if valor == "9:16":
+            modo = 'preencher'
+            self.var_aspect_modo.set('Preencher')
+
+        v_origem = str(self.video_preview_selecionado) if self.video_preview_selecionado else None
+        cfg_origem = self.configs_individuais.get(v_origem, {}) if v_origem else {}
+
+        for v in self.videos_carregados:
+            vs = str(v)
+            cfg = self.configs_individuais.setdefault(vs, {'y': 682, 'x': 0, 'zoom': 1.0, 'crop': None})
+            cfg['aspect_video'] = valor
+            cfg['aspect_modo'] = modo
+            self._aplicar_posicao_padrao_aspect(cfg, valor)
+            if vs != v_origem and cfg_origem:
+                cfg['zoom'] = cfg_origem.get('zoom', cfg['zoom'])
+            self._gerar_thumb_card(vs, force_regenerate=True)
         if self.video_preview_selecionado:
             self.gerar_preview_visual()
+        self.salvar_config()
+        messagebox.showinfo("Sucesso", f"Redimensionamento e posicionamento aplicados a {len(self.videos_carregados)} vídeo(s)!")
+
+    def aplicar_posicao_todos(self):
+        """Copia só a posição (x, y) do vídeo atualmente selecionado — ajustada manualmente
+        pelos botões ⬆/⬇ do card ou arrastando no preview — para todos os demais vídeos,
+        sem mexer em proporção/modo de corte. Use quando quiser posicionar um vídeo de
+        referência e replicar a mesma posição pros outros."""
+        if not self.videos_carregados:
+            return
+        if not self.video_preview_selecionado:
+            messagebox.showwarning("Aviso", "Selecione e posicione um vídeo de referência primeiro.")
+            return
+        v_origem = str(self.video_preview_selecionado)
+        cfg_origem = self.configs_individuais.get(v_origem)
+        if not cfg_origem:
+            messagebox.showwarning("Aviso", "Selecione e posicione um vídeo de referência primeiro.")
+            return
+
+        for v in self.videos_carregados:
+            vs = str(v)
+            cfg = self.configs_individuais.setdefault(vs, {'y': 682, 'x': 0, 'zoom': 1.0, 'crop': None})
+            cfg['x'] = cfg_origem.get('x', cfg['x'])
+            cfg['y'] = cfg_origem.get('y', cfg['y'])
+            if vs in self.labels_status_indiv:
+                self.labels_status_indiv[vs].configure(text=f"Y:{cfg['y']}")
+            self._gerar_thumb_card(vs, force_regenerate=True)
+        self.gerar_preview_visual()
+        self.salvar_config()
+        messagebox.showinfo("Sucesso", f"Posição replicada para {len(self.videos_carregados)} vídeo(s)!")
+
+    def _abrir_corte_video_selecionado(self):
+        """Atalho do painel de preview para abrir a ferramenta de recorte (crop) do vídeo
+        atualmente selecionado na área de edição."""
+        if not self.video_preview_selecionado:
+            messagebox.showwarning("Aviso", "Selecione um vídeo na área de edição primeiro.")
+            return
+        self.abrir_selecao_corte(self.video_preview_selecionado)
 
     def mover_wm(self, dx, dy):
         """Move a marca d'água pelos botões de seta da aba Marca.
@@ -273,6 +489,9 @@ class EditorAutomaDarkApp(ctk.CTk):
         self.btn_processar = ctk.CTkButton(f_menu_topo, text="▶ PROCESSAR", command=self.iniciar_processamento, fg_color="#2ecc71", hover_color="#27ae60", text_color="white", height=34, corner_radius=6, font=ctk.CTkFont(weight="bold", size=11))
         self.btn_processar.pack(fill="x", pady=(10, 3))
         ctk.CTkButton(f_menu_topo, text="📁 Abrir Saída", command=self.selecionar_saida, **btn_style).pack(fill="x", pady=3)
+        ctk.CTkButton(f_menu_topo, text="🗑️ Excluir Todos", command=self.excluir_todos_videos,
+                      fg_color="#e74c3c", hover_color="#c0392b", text_color="white", height=28,
+                      corner_radius=6, font=ctk.CTkFont(size=11)).pack(fill="x", pady=3)
         self.lbl_contador_esq = ctk.CTkLabel(f_menu_topo, text="📥 0 vídeo(s)", anchor="w", font=ctk.CTkFont(size=10), wraplength=140)
         self.lbl_contador_esq.pack(fill="x", pady=(8, 0))
 
@@ -291,6 +510,7 @@ class EditorAutomaDarkApp(ctk.CTk):
 
         # (O redimensionamento/proporção do vídeo fica no painel de Preview, à direita.)
         self.var_aspect_video = ctk.StringVar(value="Nenhum")
+        self.var_aspect_modo = ctk.StringVar(value="Ajustar")
 
         # TAB MARCA
         tab_marca = self.tabview_configs.tab("Marca")
@@ -351,7 +571,7 @@ class EditorAutomaDarkApp(ctk.CTk):
         f_y.pack(fill="x", pady=2)
         ctk.CTkLabel(f_y, text="Y", width=35, anchor="e", font=ctk.CTkFont(size=9)).pack(side="left", padx=3)
         self.slider_y = ctk.CTkSlider(f_y, from_=0, to=1920, button_color="#2ecc71", command=self.atualizar_marca_dagua_preview)
-        self.slider_y.set(800)
+        self.slider_y.set(650)
         self.slider_y.pack(side="left", fill="x", expand=True, padx=3)
 
         # ==================== ÁREA CENTRAL ====================
@@ -364,6 +584,9 @@ class EditorAutomaDarkApp(ctk.CTk):
         self.toolbar_grid.grid(row=0, column=0, sticky="ew")
         self.f_tb = ctk.CTkFrame(self.toolbar_grid, fg_color="transparent")
         self.f_tb.pack(side="left", padx=15, pady=10, fill="x", expand=True)
+        ctk.CTkButton(self.toolbar_grid, text="🗑️ Excluir Todos", command=self.excluir_todos_videos,
+                      fg_color="#e74c3c", hover_color="#c0392b", text_color="white", height=28,
+                      width=120, corner_radius=6, font=ctk.CTkFont(size=11)).pack(side="right", padx=15, pady=10)
         self.atualizar_abas()
         
         self.grid_frame = ctk.CTkScrollableFrame(self.area_central, fg_color="transparent")
@@ -413,19 +636,34 @@ class EditorAutomaDarkApp(ctk.CTk):
         # Redimensionar vídeo (proporção) — logo abaixo do preview
         f_aspect = ctk.CTkFrame(self.f_image_container, fg_color="#2b2d31", corner_radius=8)
         f_aspect.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 8))
-        ctk.CTkLabel(f_aspect, text="Redimensionar vídeo:", font=ctk.CTkFont(size=10, weight="bold")).pack(anchor="w", padx=8, pady=(6, 2))
-        ctk.CTkRadioButton(f_aspect, text="Nenhum (original)", variable=self.var_aspect_video, value="Nenhum",
-                            font=ctk.CTkFont(size=10), radiobutton_width=14, radiobutton_height=14,
-                            command=self._ao_mudar_aspect_video).pack(anchor="w", padx=8, pady=2)
+        ctk.CTkLabel(f_aspect, text="Redimensionar para", font=ctk.CTkFont(size=10, weight="bold")).pack(anchor="w", padx=8, pady=(8, 2))
         ctk.CTkRadioButton(f_aspect, text="Feed Square — 1:1", variable=self.var_aspect_video, value="1:1",
                             font=ctk.CTkFont(size=10), radiobutton_width=14, radiobutton_height=14,
                             command=self._ao_mudar_aspect_video).pack(anchor="w", padx=8, pady=2)
         ctk.CTkRadioButton(f_aspect, text="Feed Portrait — 4:5", variable=self.var_aspect_video, value="4:5",
                             font=ctk.CTkFont(size=10), radiobutton_width=14, radiobutton_height=14,
                             command=self._ao_mudar_aspect_video).pack(anchor="w", padx=8, pady=2)
-        ctk.CTkRadioButton(f_aspect, text="🔲 Preencher (encaixar nas laterais)", variable=self.var_aspect_video, value="Preencher",
+        ctk.CTkRadioButton(f_aspect, text="Stories — 9:16", variable=self.var_aspect_video, value="9:16",
                             font=ctk.CTkFont(size=10), radiobutton_width=14, radiobutton_height=14,
-                            command=self._ao_mudar_aspect_video).pack(anchor="w", padx=8, pady=(2, 6))
+                            command=self._ao_mudar_aspect_video).pack(anchor="w", padx=8, pady=(2, 8))
+
+        ctk.CTkLabel(f_aspect, text="Opções de corte", font=ctk.CTkFont(size=10, weight="bold")).pack(anchor="w", padx=8, pady=(0, 4))
+        self.seg_aspect_modo = ctk.CTkSegmentedButton(f_aspect, values=["Preencher", "Ajustar"],
+                                                       variable=self.var_aspect_modo,
+                                                       font=ctk.CTkFont(size=10),
+                                                       selected_color="#2ecc71", selected_hover_color="#27ae60",
+                                                       command=self._ao_mudar_aspect_modo)
+        self.seg_aspect_modo.pack(fill="x", padx=8, pady=(0, 8))
+
+        ctk.CTkButton(f_aspect, text="🌐 Aplicar a todos os vídeos", command=self.aplicar_aspect_video_todos,
+                      fg_color="#e67e22", hover_color="#d35400", text_color="white", height=26,
+                      corner_radius=6, font=ctk.CTkFont(size=10)).pack(fill="x", padx=8, pady=(2, 4))
+        ctk.CTkButton(f_aspect, text="📍 Aplicar posição a todos", command=self.aplicar_posicao_todos,
+                      fg_color="#8e44ad", hover_color="#732d91", text_color="white", height=26,
+                      corner_radius=6, font=ctk.CTkFont(size=10)).pack(fill="x", padx=8, pady=(0, 4))
+        ctk.CTkButton(f_aspect, text="✂ Editar Recorte", command=self._abrir_corte_video_selecionado,
+                      fg_color="#3498db", hover_color="#2980b9", text_color="white", height=26,
+                      corner_radius=6, font=ctk.CTkFont(size=10)).pack(fill="x", padx=8, pady=(0, 8))
 
         # Botão de exportar — mesma ação do "PROCESSAR VÍDEOS", exporta todos os vídeos da área de edição
         self.btn_exportar_preview = ctk.CTkButton(self.f_image_container, text="⬇ Exportar Vídeos",
@@ -435,29 +673,40 @@ class EditorAutomaDarkApp(ctk.CTk):
         self.btn_exportar_preview.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 14))
 
     def selecionar_entrada(self):
+        dir_inicial = self.ultima_pasta_entrada if self.ultima_pasta_entrada else os.path.expanduser("~")
         arquivos = filedialog.askopenfilenames(
             title="Selecionar Vídeos",
+            initialdir=dir_inicial,
             filetypes=[("Vídeos", "*.mp4 *.mov *.avi *.mkv")]
         )
         if arquivos:
             pasta = os.path.dirname(arquivos[0])
             self.pasta_entrada = pasta
-            self.videos_carregados = [Path(f) for f in arquivos]
-            total = len(self.videos_carregados)
-            
+            self.ultima_pasta_entrada = pasta
+
             try: y_base = int(self.entry_pixels.get())
             except: y_base = 682
-            
-            self.configs_individuais.clear()
-            for i, v in enumerate(self.videos_carregados):
-                self.lbl_contador_esq.configure(text=f"Analisando bordas {i+1}/{total}...")
+
+            # Acumula: os vídeos já presentes na área de edição são preservados, os novos
+            # são adicionados ao final (sem duplicar os que já foram enviados antes).
+            existentes = set(str(v) for v in self.videos_carregados)
+            novos = [Path(f) for f in arquivos if str(Path(f)) not in existentes]
+            total_novos = len(novos)
+
+            for i, v in enumerate(novos):
+                self.lbl_contador_esq.configure(text=f"Analisando bordas {i+1}/{total_novos}...")
                 self.update()
                 crop_val = self.detectar_crop_automatico(str(v))
-                self.configs_individuais[str(v)] = {'y': y_base, 'x': 0, 'zoom': 1.0, 'crop': crop_val}
+                self.configs_individuais[str(v)] = {'y': y_base, 'x': 0, 'zoom': 1.0, 'crop': crop_val, 'aspect_video': 'Nenhum'}
+
+            self.videos_carregados.extend(novos)
             self._remapear_templates()
 
+            total = len(self.videos_carregados)
             self.lbl_contador_esq.configure(text=f"📥 {total} vídeo(s) adicionados")
-            self.active_tab_index = 0
+            # Leva o usuário até a aba onde os vídeos recém-adicionados ficaram.
+            self.active_tab_index = max(0, (total - 1) // 50)
+            self.salvar_config()
             self.atualizar_abas()
             self.renderizar_grid()
 
@@ -515,8 +764,8 @@ class EditorAutomaDarkApp(ctk.CTk):
         pasta = filedialog.askdirectory(title="Pasta de Saída", initialdir=dir_inicial)
         if pasta:
             self.ultima_pasta_saida = pasta
-            self.salvar_config()
             self.pasta_saida = pasta
+            self.salvar_config()
 
     def ajustar_individual(self, video_path_str, eixo, valor):
         if video_path_str not in self.configs_individuais: return
@@ -534,8 +783,7 @@ class EditorAutomaDarkApp(ctk.CTk):
             cfg['stretch_x'] = round(cfg['stretch_x'], 1)
             
         if video_path_str in self.labels_status_indiv:
-            stx = cfg.get('stretch_x', 1.0)
-            self.labels_status_indiv[video_path_str].configure(text=f"X:{cfg['x']} | Y:{cfg['y']} | Z:{cfg['zoom']}x | W:{stx}x")
+            self.labels_status_indiv[video_path_str].configure(text=f"Y:{cfg['y']}")
 
         # Re-start player instantly if playing this video
         if self.player_ativo and str(self.video_preview_selecionado) == video_path_str:
@@ -545,19 +793,25 @@ class EditorAutomaDarkApp(ctk.CTk):
             self.gerar_preview_visual()
             
         self._gerar_thumb_card(video_path_str)
+        self.salvar_config()
 
     def detectar_crop_automatico(self, video_path):
         import subprocess, re
         cmd = [
-            'ffmpeg', '-i', str(video_path), 
-            '-t', '1', '-vf', 'cropdetect=24:16:0', 
+            'ffmpeg', '-i', str(video_path),
+            '-t', '1', '-vf', 'cropdetect=24:16:0',
             '-f', 'null', '-'
         ]
         try:
             result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
-            match = re.search(r'crop=([0-9]+:[0-9]+:[0-9]+:[0-9]+)', result.stderr)
-            if match:
-                return match.group(1)
+            # cropdetect refina a estimativa a cada frame — os primeiros frames (fade-in,
+            # tela preta) costumam dar valores instáveis/inválidos (ex: altura 0), que
+            # travam o ffmpeg depois. Usa o ÚLTIMO valor (mais estável) e descarta
+            # qualquer crop com largura/altura zerada.
+            matches = re.findall(r'crop=([0-9]+):([0-9]+):([0-9]+):([0-9]+)', result.stderr)
+            for w, h, x, y in reversed(matches):
+                if int(w) > 0 and int(h) > 0:
+                    return f"{w}:{h}:{x}:{y}"
         except Exception as e:
             print(f"Erro no crop: {e}")
         return None
@@ -575,7 +829,8 @@ class EditorAutomaDarkApp(ctk.CTk):
             return None
 
     def abrir_selecao_corte(self, video_path):
-        """Abre um diálogo para o usuário arrastar e escolher a área de corte (crop) do vídeo,
+        """Abre um diálogo estilo ClipChamp para o usuário redimensionar a área de corte
+        (crop) do vídeo arrastando as alças nos cantos/bordas ou movendo a seleção inteira,
         com a opção de aplicar só a este vídeo ou a todos os vídeos carregados (edição em massa)."""
         v_str = str(video_path)
         dims = self._obter_dimensoes_video(v_str)
@@ -584,9 +839,17 @@ class EditorAutomaDarkApp(ctk.CTk):
             return
         real_w, real_h = dims
 
-        # Extrai um frame para exibir no diálogo, em um tamanho de exibição confortável
-        disp_w = 480
+        # Extrai um frame para exibir no diálogo, num tamanho que sempre caiba na tela junto
+        # com a barrinha de ferramentas e os botões de baixo (janela alta demais escondia os
+        # botões, especialmente em vídeos 9:16, que são bem verticais).
+        CHROME_H = 210  # toolbar + textos + botões de baixo, fora da imagem
+        max_disp_h = max(320, self.winfo_screenheight() - CHROME_H - 80)
+        max_disp_w = 420
+        disp_w = max_disp_w
         disp_h = int(disp_w * real_h / real_w)
+        if disp_h > max_disp_h:
+            disp_h = max_disp_h
+            disp_w = int(disp_h * real_w / real_h)
         frame_path = Path(os.environ.get("TEMP", "C:/Windows/Temp")) / f"crop_sel_{Path(v_str).stem}.jpg"
         cmd = ["ffmpeg", "-y", "-ss", "00:00:01", "-i", v_str, "-vframes", "1", "-update", "1",
                "-s", f"{disp_w}x{disp_h}", "-q:v", "2", str(frame_path)]
@@ -597,13 +860,25 @@ class EditorAutomaDarkApp(ctk.CTk):
 
         dialog = ctk.CTkToplevel(self)
         dialog.title(f"✂ Selecionar área de corte — {Path(v_str).name}")
-        dialog.geometry(f"{disp_w + 40}x{disp_h + 150}")
+        dialog.geometry(f"{disp_w + 40}x{disp_h + CHROME_H}")
         dialog.configure(fg_color="#2b2d31")
         dialog.grab_set()
         dialog.resizable(False, False)
 
-        ctk.CTkLabel(dialog, text="Arraste no vídeo abaixo para marcar a área de corte:",
-                     font=ctk.CTkFont(size=12)).pack(pady=(12, 6))
+        # Barrinha flutuante ✓ / ↺ (estilo ClipChamp) acima da área de vídeo
+        f_toolbar = ctk.CTkFrame(dialog, fg_color="#f2f2f2", corner_radius=16)
+        f_toolbar.pack(pady=(12, 6))
+        btn_confirmar = ctk.CTkButton(f_toolbar, text="✓", width=32, height=28, corner_radius=14,
+                                       fg_color="transparent", hover_color="#e0e0e0", text_color="#1a1a1a",
+                                       font=ctk.CTkFont(size=13, weight="bold"))
+        btn_confirmar.pack(side="left", padx=(4, 2), pady=4)
+        btn_resetar = ctk.CTkButton(f_toolbar, text="↺", width=32, height=28, corner_radius=14,
+                                     fg_color="transparent", hover_color="#e0e0e0", text_color="#1a1a1a",
+                                     font=ctk.CTkFont(size=13, weight="bold"))
+        btn_resetar.pack(side="left", padx=(2, 4), pady=4)
+
+        ctk.CTkLabel(dialog, text="Arraste as alças para ajustar a área de corte, ou arraste dentro da seleção para mover:",
+                     font=ctk.CTkFont(size=11), text_color="#9aa0a6", wraplength=disp_w).pack(pady=(0, 6))
 
         canvas = ctk.CTkCanvas(dialog, bg="#000000", highlightthickness=0, width=disp_w, height=disp_h)
         canvas.pack(padx=10)
@@ -612,33 +887,120 @@ class EditorAutomaDarkApp(ctk.CTk):
         canvas.create_image(0, 0, anchor="nw", image=frame_photo)
         dialog._frame_photo_ref = frame_photo  # evita coleta de lixo da imagem
 
-        sel = {"x0": None, "y0": None, "x1": None, "y1": None, "rect": None}
+        # Seleção começa no crop já salvo (se houver) ou no frame inteiro — igual ao
+        # ClipChamp, que sempre parte de uma seleção existente em vez de um retângulo vazio.
+        cfg_atual = self.configs_individuais.get(v_str, {})
+        crop_salvo = cfg_atual.get('crop')
+        if crop_salvo:
+            try:
+                cw, ch, cx, cy = (int(p) for p in crop_salvo.split(':'))
+                escala_x0 = disp_w / real_w
+                escala_y0 = disp_h / real_h
+                sel_inicial = (cx * escala_x0, cy * escala_y0, (cx + cw) * escala_x0, (cy + ch) * escala_y0)
+            except Exception:
+                sel_inicial = (0, 0, disp_w, disp_h)
+        else:
+            sel_inicial = (0, 0, disp_w, disp_h)
+
+        sel = {"x0": sel_inicial[0], "y0": sel_inicial[1], "x1": sel_inicial[2], "y1": sel_inicial[3]}
+        HANDLE_R = 6
+        MIN_SIZE = 20
+        drag = {"modo": None, "off_x": 0, "off_y": 0, "orig": None}
+
+        def _handles():
+            x0, y0, x1, y1 = sel["x0"], sel["y0"], sel["x1"], sel["y1"]
+            mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+            return {
+                "tl": (x0, y0), "tr": (x1, y0), "bl": (x0, y1), "br": (x1, y1),
+                "top": (mx, y0), "bottom": (mx, y1), "left": (x0, my), "right": (x1, my),
+            }
+
+        def redesenhar():
+            canvas.delete("sel")
+            x0, y0, x1, y1 = sel["x0"], sel["y0"], sel["x1"], sel["y1"]
+            canvas.create_rectangle(x0, y0, x1, y1, outline="#8e44ad", width=2, dash=(4, 3), tags="sel")
+            for nome, (hx, hy) in _handles().items():
+                if nome in ("tl", "tr", "bl", "br"):
+                    canvas.create_oval(hx - HANDLE_R, hy - HANDLE_R, hx + HANDLE_R, hy + HANDLE_R,
+                                        fill="white", outline="#8e44ad", width=1, tags="sel")
+                else:
+                    w, h = (16, 6) if nome in ("top", "bottom") else (6, 16)
+                    canvas.create_rectangle(hx - w / 2, hy - h / 2, hx + w / 2, hy + h / 2,
+                                             fill="white", outline="#8e44ad", width=1, tags="sel")
+
+        def _handle_sob_cursor(x, y):
+            for nome, (hx, hy) in _handles().items():
+                if abs(x - hx) <= HANDLE_R + 3 and abs(y - hy) <= HANDLE_R + 3:
+                    return nome
+            return None
 
         def on_press(event):
-            sel["x0"], sel["y0"] = event.x, event.y
-            if sel["rect"]:
-                canvas.delete(sel["rect"])
-            sel["rect"] = canvas.create_rectangle(event.x, event.y, event.x, event.y,
-                                                   outline="#2ecc71", width=2)
+            nome = _handle_sob_cursor(event.x, event.y)
+            if nome:
+                drag["modo"] = nome
+            elif sel["x0"] <= event.x <= sel["x1"] and sel["y0"] <= event.y <= sel["y1"]:
+                drag["modo"] = "mover"
+                drag["off_x"] = event.x - sel["x0"]
+                drag["off_y"] = event.y - sel["y0"]
+                drag["orig"] = (sel["x0"], sel["y0"], sel["x1"], sel["y1"])
+            else:
+                drag["modo"] = None
 
         def on_drag(event):
-            if sel["rect"] is None:
+            modo = drag["modo"]
+            if modo is None:
                 return
-            x1 = max(0, min(disp_w, event.x))
-            y1 = max(0, min(disp_h, event.y))
-            sel["x1"], sel["y1"] = x1, y1
-            canvas.coords(sel["rect"], sel["x0"], sel["y0"], x1, y1)
+            x = max(0, min(disp_w, event.x))
+            y = max(0, min(disp_h, event.y))
+
+            if modo == "mover":
+                ox0, oy0, ox1, oy1 = drag["orig"]
+                w, h = ox1 - ox0, oy1 - oy0
+                novo_x0 = max(0, min(disp_w - w, x - drag["off_x"]))
+                novo_y0 = max(0, min(disp_h - h, y - drag["off_y"]))
+                sel["x0"], sel["y0"], sel["x1"], sel["y1"] = novo_x0, novo_y0, novo_x0 + w, novo_y0 + h
+            elif modo == "tl":
+                sel["x0"] = min(x, sel["x1"] - MIN_SIZE)
+                sel["y0"] = min(y, sel["y1"] - MIN_SIZE)
+            elif modo == "tr":
+                sel["x1"] = max(x, sel["x0"] + MIN_SIZE)
+                sel["y0"] = min(y, sel["y1"] - MIN_SIZE)
+            elif modo == "bl":
+                sel["x0"] = min(x, sel["x1"] - MIN_SIZE)
+                sel["y1"] = max(y, sel["y0"] + MIN_SIZE)
+            elif modo == "br":
+                sel["x1"] = max(x, sel["x0"] + MIN_SIZE)
+                sel["y1"] = max(y, sel["y0"] + MIN_SIZE)
+            elif modo == "top":
+                sel["y0"] = min(y, sel["y1"] - MIN_SIZE)
+            elif modo == "bottom":
+                sel["y1"] = max(y, sel["y0"] + MIN_SIZE)
+            elif modo == "left":
+                sel["x0"] = min(x, sel["x1"] - MIN_SIZE)
+            elif modo == "right":
+                sel["x1"] = max(x, sel["x0"] + MIN_SIZE)
+
+            redesenhar()
+
+        def on_release(event):
+            drag["modo"] = None
+
+        def resetar_selecao():
+            sel["x0"], sel["y0"], sel["x1"], sel["y1"] = 0, 0, disp_w, disp_h
+            redesenhar()
+
+        btn_resetar.configure(command=resetar_selecao)
+        btn_confirmar.configure(command=lambda: aplicar(True))
 
         canvas.bind("<ButtonPress-1>", on_press)
         canvas.bind("<B1-Motion>", on_drag)
+        canvas.bind("<ButtonRelease-1>", on_release)
+        redesenhar()
 
         f_btns = ctk.CTkFrame(dialog, fg_color="transparent")
         f_btns.pack(fill="x", padx=15, pady=(10, 15))
 
         def _crop_string_da_selecao():
-            if None in (sel["x0"], sel["y0"], sel["x1"], sel["y1"]):
-                messagebox.showwarning("Aviso", "Arraste no vídeo para marcar a área de corte primeiro.", parent=dialog)
-                return None
             x0, x1 = sorted((sel["x0"], sel["x1"]))
             y0, y1 = sorted((sel["y0"], sel["y1"]))
             if x1 - x0 < 5 or y1 - y0 < 5:
@@ -760,11 +1122,6 @@ class EditorAutomaDarkApp(ctk.CTk):
             header_card = ctk.CTkFrame(card, fg_color="transparent")
             header_card.pack(fill="x", padx=2, pady=(2, 0))
 
-            btn_crop = ctk.CTkButton(header_card, text="✂", width=10, height=14, fg_color="#f39c12", hover_color="#d68910",
-                                      font=ctk.CTkFont(size=8, weight="bold"),
-                                      command=lambda v=video: self.abrir_selecao_corte(v))
-            btn_crop.pack(side="left", padx=1)
-
             lbl_title = ctk.CTkLabel(header_card, text=video.name[:6], font=ctk.CTkFont(size=8))
             lbl_title.pack(side="left", padx=1)
 
@@ -782,47 +1139,25 @@ class EditorAutomaDarkApp(ctk.CTk):
             self._gerar_thumb_card(v_str)
 
             # --- Controles Individuais ---
-            # Zoom/esticar em grade 2x2 (em vez de 4 botões numa fileira só) para o card
-            # ficar mais estreito e caber mais miniaturas lado a lado.
-            f_controls_zoom = ctk.CTkFrame(card, fg_color="transparent")
-            f_controls_zoom.pack(pady=1)
-            mini_btn = {"width": 20, "height": 15, "font": ctk.CTkFont(size=8)}
-
-            btn_z_in = ctk.CTkButton(f_controls_zoom, text="Z+", fg_color="#3498db", hover_color="#2980b9", **mini_btn,
-                                     command=lambda v=v_str: self.ajustar_individual(v, 'zoom', 0.1))
-            btn_z_in.grid(row=0, column=0, padx=1, pady=1)
-            btn_z_out = ctk.CTkButton(f_controls_zoom, text="Z-", fg_color="#e74c3c", hover_color="#c0392b", **mini_btn,
-                                      command=lambda v=v_str: self.ajustar_individual(v, 'zoom', -0.1))
-            btn_z_out.grid(row=0, column=1, padx=1, pady=1)
-            btn_sx_in = ctk.CTkButton(f_controls_zoom, text="W+", fg_color="#2ecc71", hover_color="#27ae60", **mini_btn,
-                                     command=lambda v=v_str: self.ajustar_individual(v, 'stretch_x', 0.1))
-            btn_sx_in.grid(row=1, column=0, padx=1, pady=1)
-            btn_sx_out = ctk.CTkButton(f_controls_zoom, text="W-", fg_color="#e67e22", hover_color="#d35400", **mini_btn,
-                                     command=lambda v=v_str: self.ajustar_individual(v, 'stretch_x', -0.1))
-            btn_sx_out.grid(row=1, column=1, padx=1, pady=1)
-
-            # Posição X/Y em cruz (D-pad), igual ao padrão da aba Marca — 3 colunas de
-            # largura em vez de 4, também para economizar largura do card.
+            # Os vídeos já chegam prontos no seu próprio padrão (proporção/tamanho), então
+            # o único ajuste útil por vídeo é a posição vertical: 3 velocidades (1x, 2x, 3x)
+            # para cada sentido, em vez de setinhas — deixa explícito quanto cada clique move.
             f_controls_pos = ctk.CTkFrame(card, fg_color="transparent")
-            f_controls_pos.pack(pady=(0, 2))
-            dpad_btn = {"width": 20, "height": 15, "font": ctk.CTkFont(size=8)}
+            f_controls_pos.pack(pady=(2, 2))
+            pos_btn = {"width": 20, "height": 15, "font": ctk.CTkFont(size=8)}
+            passo = 20
 
-            btn_up = ctk.CTkButton(f_controls_pos, text="⬆", fg_color="#f39c12", hover_color="#d68910", **dpad_btn,
-                                    command=lambda v=v_str: self.ajustar_individual(v, 'y', -20))
-            btn_up.grid(row=0, column=1, padx=1, pady=1)
-            btn_left = ctk.CTkButton(f_controls_pos, text="⬅", fg_color="#8e44ad", hover_color="#732d91", **dpad_btn,
-                                      command=lambda v=v_str: self.ajustar_individual(v, 'x', -20))
-            btn_left.grid(row=1, column=0, padx=1, pady=1)
-            btn_right = ctk.CTkButton(f_controls_pos, text="➡", fg_color="#8e44ad", hover_color="#732d91", **dpad_btn,
-                                       command=lambda v=v_str: self.ajustar_individual(v, 'x', 20))
-            btn_right.grid(row=1, column=2, padx=1, pady=1)
-            btn_dw = ctk.CTkButton(f_controls_pos, text="⬇", fg_color="#f39c12", hover_color="#d68910", **dpad_btn,
-                                    command=lambda v=v_str: self.ajustar_individual(v, 'y', 20))
-            btn_dw.grid(row=2, column=1, padx=1, pady=1)
+            for btn_col, mult in enumerate((1, 2, 3)):
+                btn = ctk.CTkButton(f_controls_pos, text=f"⬆{mult}x", fg_color="#f39c12", hover_color="#d68910", **pos_btn,
+                                     command=lambda v=v_str, m=mult: self.ajustar_individual(v, 'y', -passo * m))
+                btn.grid(row=0, column=btn_col, padx=1, pady=1)
+            for btn_col, mult in enumerate((1, 2, 3)):
+                btn = ctk.CTkButton(f_controls_pos, text=f"⬇{mult}x", fg_color="#f39c12", hover_color="#d68910", **pos_btn,
+                                     command=lambda v=v_str, m=mult: self.ajustar_individual(v, 'y', passo * m))
+                btn.grid(row=1, column=btn_col, padx=1, pady=1)
 
             cfg = self.configs_individuais.get(v_str, {'y': 682, 'x': 0, 'zoom': 1.0, 'stretch_x': 1.0})
-            stx = cfg.get('stretch_x', 1.0)
-            lbl_status = ctk.CTkLabel(card, text=f"Z{cfg['zoom']} W{stx}", font=ctk.CTkFont(size=8, weight="bold"))
+            lbl_status = ctk.CTkLabel(card, text=f"Y:{cfg['y']}", font=ctk.CTkFont(size=8, weight="bold"))
             lbl_status.pack(pady=1)
             self.labels_status_indiv[v_str] = lbl_status
             
@@ -841,6 +1176,9 @@ class EditorAutomaDarkApp(ctk.CTk):
 
     def selecionar_video_para_preview(self, video_path, card_widget):
         self.video_preview_selecionado = video_path
+        cfg = self.configs_individuais.get(str(video_path), {})
+        self.var_aspect_video.set(cfg.get('aspect_video', 'Nenhum'))
+        self.var_aspect_modo.set('Preencher' if cfg.get('aspect_modo', 'ajustar') == 'preencher' else 'Ajustar')
         try: self.focus_set()
         except: pass
         for widget in self.grid_frame.winfo_children():
@@ -883,6 +1221,35 @@ class EditorAutomaDarkApp(ctk.CTk):
         self.preview_canvas.delete("all")
         cx, cy = self._centro_preview()
         self.preview_canvas.create_text(cx, cy, text="Selecione um vídeo\npara ver o preview", fill="#5f6368", justify="center", font=("Segoe UI", 9), tags=("placeholder",))
+        self.salvar_config()
+        self.atualizar_abas()
+        self.renderizar_grid()
+
+    def excluir_todos_videos(self):
+        if not self.videos_carregados:
+            return
+        if not messagebox.askyesno("Excluir Todos", f"Remover todos os {len(self.videos_carregados)} vídeo(s) da área de edição?"):
+            return
+
+        if self.player_ativo:
+            self.pausar_player()
+
+        self.videos_carregados = []
+        self.configs_individuais = {}
+        self.labels_status_indiv = {}
+        self.labels_thumb_indiv = {}
+        self.templates_carregados = []
+        self.template_por_video = {}
+        self.template_path = ""
+        self.video_preview_selecionado = None
+        self.active_tab_index = 0
+
+        self.btn_template.configure(text="🖼️ Template")
+        self.preview_canvas.delete("all")
+        cx, cy = self._centro_preview()
+        self.preview_canvas.create_text(cx, cy, text="Selecione um vídeo\npara ver o preview", fill="#5f6368", justify="center", font=("Segoe UI", 9), tags=("placeholder",))
+        self.lbl_contador_esq.configure(text="📥 0 vídeo(s)")
+        self.salvar_config()
         self.atualizar_abas()
         self.renderizar_grid()
 
@@ -901,23 +1268,30 @@ class EditorAutomaDarkApp(ctk.CTk):
             self.active_tab_index = 0
             
         for i in range(num_tabs):
-            tab_name = f"Aba {i+1}"
+            inicio, fim = i * 50 + 1, min((i + 1) * 50, num_videos)
+            tab_name = f"🎬 {inicio}–{fim}" if num_videos else "🎬 1–50"
             is_active = (i == self.active_tab_index)
             color = "#2ecc71" if is_active else "#383a40"
-            text_color = "black" if is_active else "white"
+            text_color = "black" if is_active else "#d0d2d6"
             hover_color = "#27ae60" if is_active else "#474a51"
-            
+
             btn = ctk.CTkButton(
-                self.f_tb, 
-                text=tab_name, 
-                fg_color=color, 
-                text_color=text_color, 
+                self.f_tb,
+                text=tab_name,
+                fg_color=color,
+                text_color=text_color,
                 hover_color=hover_color,
-                width=80, 
-                height=25,
+                corner_radius=14,
+                width=96,
+                height=28,
+                font=ctk.CTkFont(size=11, weight="bold"),
+                border_width=0,
                 command=lambda idx=i: self.mudar_aba(idx)
             )
-            btn.pack(side="left", padx=5)
+            btn.pack(side="left", padx=(0, 8))
+            if i == 0:
+                ctk.CTkLabel(self.f_tb, text="│  Área de edição", font=ctk.CTkFont(size=10),
+                             text_color="#6b7075").pack(side="left", padx=(2, 12))
 
     def mudar_aba(self, idx):
         self.active_tab_index = idx
@@ -1024,6 +1398,12 @@ class EditorAutomaDarkApp(ctk.CTk):
         reservado_h = 90  # botão de play + seletor de proporção logo abaixo do canvas
         avail_w = max(50, cont_w - 8)
         avail_h = max(50, cont_h - reservado_h)
+
+        # Preview compacto: não estica pra ocupar todo o espaço vertical disponível
+        # (isso empurrava o painel "Redimensionar para" e os botões pra fora da tela em
+        # janelas altas) — fica sempre no mesmo tamanho pequeno, mostrando o 9:16 inteiro.
+        MAX_PREVIEW_W = 230
+        avail_w = min(avail_w, MAX_PREVIEW_W)
 
         target_w = avail_w
         target_h = int(target_w * 1920 / 1080)
@@ -1206,7 +1586,6 @@ class EditorAutomaDarkApp(ctk.CTk):
             'audio_melhorado': False,
             'anti_dup': True,
             'auto_crop': True,
-            'aspect_video': self.var_aspect_video.get(),
             'wm_text': self.entry_wm_text.get(),
             'wm_cor': self.cb_cor_wm.get(),
             'wm_fonte': self.cb_fonte_wm.get(),
@@ -1223,6 +1602,10 @@ class EditorAutomaDarkApp(ctk.CTk):
         if not self.pasta_saida:
             messagebox.showwarning("Aviso", "Selecione a pasta de saída (Abrir Saída).")
             return
+        if self.player_ativo:
+            # Evita rodar o ffmpeg do player de preview E o da exportação ao mesmo tempo,
+            # dobrando a carga de CPU sem necessidade.
+            self.pausar_player()
         self.btn_processar.configure(state="disabled")
         self.btn_exportar_preview.configure(state="disabled")
         self.motor.iniciar(self.videos_carregados, self.template_por_video, self.pasta_saida, self.obter_configs_atuais(), self.configs_individuais)
@@ -1232,6 +1615,9 @@ class EditorAutomaDarkApp(ctk.CTk):
         self.barra_status.set(perc)
         
     def carregar_config(self):
+        """Ao reabrir o software, a área de edição (vídeos, ajustes individuais e templates)
+        sempre começa zerada — só o histórico de pastas usadas em cada seletor de arquivo
+        é lembrado, para agilizar a próxima escolha."""
         if os.path.exists(self.config_file):
             try:
                 import json
@@ -1240,6 +1626,7 @@ class EditorAutomaDarkApp(ctk.CTk):
                     self.ultima_pasta_entrada = dados.get("ultima_pasta_entrada", "")
                     self.ultima_pasta_saida = dados.get("ultima_pasta_saida", "")
                     self.ultimo_template = dados.get("ultimo_template", "")
+                    self.pasta_saida = self.ultima_pasta_saida
             except Exception:
                 pass
 
@@ -1249,7 +1636,7 @@ class EditorAutomaDarkApp(ctk.CTk):
             dados = {
                 "ultima_pasta_entrada": getattr(self, "pasta_entrada", getattr(self, "ultima_pasta_entrada", "")),
                 "ultima_pasta_saida": getattr(self, "pasta_saida", getattr(self, "ultima_pasta_saida", "")),
-                "ultimo_template": getattr(self, "template_path", getattr(self, "ultimo_template", ""))
+                "ultimo_template": getattr(self, "template_path", getattr(self, "ultimo_template", "")),
             }
             with open(self.config_file, "w", encoding="utf-8") as f:
                 json.dump(dados, f, ensure_ascii=False, indent=4)

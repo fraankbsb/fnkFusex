@@ -70,15 +70,27 @@ def test_build_filter_complex_video_config_overrides_zoom_and_position():
     assert f"scale={int(out_w * 0.5)}" in filtros or f"scale={int(out_w * 0.5) + 1}" in filtros
 
 
-def test_build_filter_complex_preencher_ignores_zoom_and_fits_exact_width():
+def test_build_filter_complex_preencher_covers_canvas_and_crops():
     out_w, out_h = get_res_dimensions("1080p")
-    # Mesmo com zoom reduzido, o modo "Preencher" deve ignorá-lo e encaixar a largura
-    # exatamente em out_w, mantendo a proporção (altura automática via -2).
-    video_config = {"y": 100, "x": 50, "zoom": 0.5, "stretch_x": 1.0}
+    # No modo "preencher" (cover), o vídeo recortado na proporção escolhida deve ser
+    # escalado para cobrir o canvas inteiro e depois cortado no tamanho exato (sem gaps).
+    video_config = {"y": 100, "x": 50, "zoom": 0.5, "stretch_x": 1.0, "aspect_video": "1:1", "aspect_modo": "preencher"}
     filtros, _ = build_filter_complex(
-        "input.mp4", "", base_configs(aspect_video="Preencher"), video_config, out_w, out_h
+        "input.mp4", "", base_configs(), video_config, out_w, out_h
     )
-    assert f"scale={out_w}:-2[vid]" in filtros
+    assert f"crop={out_w}:{out_h}[vid]" in filtros
+
+
+def test_build_filter_complex_ajustar_fits_within_canvas():
+    out_w, out_h = get_res_dimensions("1080p")
+    # No modo "ajustar" (contain), o vídeo recortado na proporção escolhida deve caber
+    # inteiro dentro do canvas, sem cortar.
+    video_config = {"y": 682, "x": 0, "zoom": 1.0, "aspect_video": "1:1", "aspect_modo": "ajustar"}
+    filtros, _ = build_filter_complex(
+        "input.mp4", "", base_configs(), video_config, out_w, out_h
+    )
+    assert f"crop={out_w}:{out_h}[vid]" not in filtros
+    assert "[vid]" in filtros
 
 
 def test_build_filter_complex_no_aspect_video_skips_extra_crop():
@@ -87,15 +99,28 @@ def test_build_filter_complex_no_aspect_video_skips_extra_crop():
     assert "min(iw" not in filtros
 
 
-def test_build_filter_complex_aspect_video_1x1_crops_square_centered():
+def test_build_filter_complex_aspect_video_1x1_ajustar_fits_no_extra_crop():
     out_w, out_h = get_res_dimensions("1080p")
-    filtros, _ = build_filter_complex("input.mp4", "", base_configs(aspect_video="1:1"), None, out_w, out_h)
-    assert "crop=w='min(iw\\,ih*1.0)':h='min(ih\\,iw/1.0)'" in filtros
-    # A proporção só recorta o vídeo — o canvas de saída (fundo/template) continua no tamanho normal.
+    # Os vídeos já chegam pré-cortados na proporção escolhida, então o app não deve
+    # recortar de novo — só escalar/posicionar no canvas (modo "ajustar" = contain).
+    video_config = {"y": 682, "x": 0, "zoom": 1.0, "aspect_video": "1:1", "aspect_modo": "ajustar"}
+    filtros, _ = build_filter_complex("input.mp4", "", base_configs(), video_config, out_w, out_h)
+    assert "min(iw" not in filtros
+    assert f"if(gte(a,{out_w}/{out_h}),{out_w},-2)" in filtros
+    # A proporção só afeta o posicionamento — o canvas de saída (fundo/template) continua no tamanho normal.
     assert f"s={out_w}x{out_h}" in filtros or f":s={out_w}x{out_h}" in filtros
 
 
-def test_build_filter_complex_aspect_video_4x5():
+def test_build_filter_complex_aspect_video_4x5_preencher_covers_and_crops():
     out_w, out_h = get_res_dimensions("1080p")
-    filtros, _ = build_filter_complex("input.mp4", "", base_configs(aspect_video="4:5"), None, out_w, out_h)
-    assert "ih*0.8" in filtros
+    video_config = {"y": 682, "x": 0, "zoom": 1.0, "aspect_video": "4:5", "aspect_modo": "preencher"}
+    filtros, _ = build_filter_complex("input.mp4", "", base_configs(), video_config, out_w, out_h)
+    assert "min(iw" not in filtros
+    assert f"crop={out_w}:{out_h}[vid]" in filtros
+
+
+def test_build_filter_complex_aspect_video_9x16_no_extra_crop():
+    out_w, out_h = get_res_dimensions("1080p")
+    video_config = {"y": 682, "x": 0, "zoom": 1.0, "aspect_video": "9:16"}
+    filtros, _ = build_filter_complex("input.mp4", "", base_configs(), video_config, out_w, out_h)
+    assert "min(iw" not in filtros

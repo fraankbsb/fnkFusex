@@ -1,0 +1,6 @@
+{
+  "repo": "fraankbsb/fnkFusex",
+  "app_title": "fnkTemplater",
+  "entry_point": "Fusex.exe",
+  "payload_files": ["Fusex.exe"]
+}

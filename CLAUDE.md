@@ -46,6 +46,40 @@ pyinstaller TemplaterFNK.spec
 as a data file and produce a console-enabled exe (not windowed), so stdout/stderr are visible when run from
 `dist/`. `resource_path()` in `editor_automacao.py` resolves bundled resources via `sys._MEIPASS` when frozen.
 
+## Sistema de auto-update
+
+O app roda em varios PCs. Em vez de copiar `Fusex.exe` manualmente entre eles, existe um sistema de
+launcher + releases no GitHub, no mesmo molde do `fnkDownloader` (`D:\fnkSocialMidia\fnkDonwloader`) —
+unica diferenca real: aqui o payload publicado e o **binario `Fusex.exe` ja compilado** (nao um script
+`.py`), porque o app depende de customtkinter/Pillow/pilmoji/ffmpeg e as maquinas de destino nao tem
+Python instalado, so o launcher.
+
+- **Repositorio**: `fraankbsb/fnkFusex` no GitHub, **privado**.
+- **`launcher.py`** → compilado em `FusexLauncher.exe` (PyInstaller `--onefile --windowed`). Tem 2 botoes:
+  "Atualizar App" (baixa a release mais recente do GitHub e sobrescreve o `Fusex.exe` local) e "Iniciar App"
+  (abre `Fusex.exe` direto via `subprocess.Popen`, sem precisar de python na maquina). So precisa
+  recompilar quando `launcher.py` MESMO muda — mudancas em `editor_automacao.py` nao exigem recompilar o
+  launcher, so publicar release normal (`publish.py`). Comando de build:
+  `python -m PyInstaller --onefile --windowed --name FusexLauncher --distpath . --workpath build launcher.py`
+  — depois `rm -rf build FusexLauncher.spec` e reanexar o `.exe` + `update_config.json` na release mais
+  recente (nao sao republicados via `publish.py`, que so mexe no payload):
+  `gh release upload <tag> FusexLauncher.exe update_config.json --repo fraankbsb/fnkFusex --clobber`.
+  **Atencao:** isso precisa ser refeito a cada nova release — o asset fica preso na tag antiga, e a tag
+  "latest" muda a cada `publish.py`.
+- **`publish.py`** → roda no PC de edicao. Builda o `Fusex.exe` com `pyinstaller TemplaterFNK.spec`, sobe a
+  versao (patch +1) em `version.json`, da commit+push no repo (codigo-fonte, nunca o `.exe`), empacota
+  `Fusex.exe` + `version.json` num zip e publica como GitHub Release via `gh release create`.
+  Uso: `python publish.py auto` (versao/mensagem automaticas) ou `python publish.py 1.0.1 "mensagem"`.
+- **`watch_and_publish.py`** + **`iniciar_vigia.bat`** → vigia que fica monitorando `editor_automacao.py` e
+  `TemplaterFNK.spec`; ao detectar mudanca salva, espera 8s de silencio e chama `publish.py auto` sozinho.
+  Dar duplo-clique no `.bat` no inicio de uma sessao de edicao.
+- **`update_config.json`** → config do projeto: `repo` (`fraankbsb/fnkFusex`), `entry_point` (`Fusex.exe`),
+  `app_title`, `payload_files` (`["Fusex.exe"]`). `version.json` guarda a versao local instalada.
+- `Fusex.exe` e `*.exe` em geral **nunca sao commitados no git** (`.gitignore`) — so existem localmente
+  (build) e como asset anexado nas GitHub Releases. Isso evita inchar o historico do repo a cada rebuild.
+- Numeracao de versao so pode subir (nunca republicar com o mesmo numero ou menor, senao o launcher nao
+  detecta a atualizacao).
+
 ## Repo hygiene notes
 
 The root directory contains many one-off `fix_*.py`, `patch_*.py`, `test_*.py`, and `debug_*.py` scripts and
@@ -89,3 +123,45 @@ When changing compositing/rendering behavior, keep the preview path (`gerar_prev
 `atualizar_preview_frases`, the player) and the export path (`ProcessadorVideo._executar_ffmpeg`) in sync —
 both ultimately depend on `build_filter_complex()` and the same `configs`/`configs_individuais`/
 `frases_por_video` state, and diverging them is a common source of "preview doesn't match export" bugs.
+
+## Video aspect ratio handling
+
+Videos are always uploaded already pre-cropped to one of three native ratios: 1:1, 4:5, or 9:16 —
+`build_filter_complex()` does **not** re-crop to force a ratio (that was removed; it caused unwanted
+zoom/cropping on already-correct videos). The "Redimensionar para" panel (right side, below the preview)
+only has 3 radio options (Feed Square 1:1, Feed Portrait 4:5, Stories 9:16 — no "Nenhum") plus a
+Preencher/Ajustar toggle (cover vs contain).
+
+Each ratio has a fixed default vertical position, applied automatically when the ratio is picked (single
+video) or via "Aplicar a todos os vídeos" (`POSICAO_Y_PADRAO_ASPECT` dict + `_aplicar_posicao_padrao_aspect()`
+in `editor_automacao.py`):
+- **1:1** → y = 738.3
+- **4:5** → y = 520.9
+- **9:16** → y = 0, x = 0, mode forced to "preencher" (must fill the entire template)
+
+All videos of the same ratio should land in the same position — don't reintroduce per-video origin-copy
+logic for x/y when applying to all.
+
+## Per-video card controls (grid view)
+
+Each video card only has vertical-position buttons now (no zoom/stretch/left-right — videos already arrive
+at the correct size): two rows of 3 buttons, `⬆1x ⬆2x ⬆3x` / `⬇1x ⬇2x ⬇3x`, moving the video up/down at 1x,
+2x, or 3x the base step (20px). The card status label shows only `Y:<value>`. The crop-selection ("✂")
+button was removed from the card header.
+
+`detectar_crop_automatico()` (auto black-bar crop on video upload) uses the **last** stable `cropdetect`
+match, not the first — early frames (fade-ins, black intros) can report invalid `crop=W:0:X:Y` boxes that
+would otherwise crash ffmpeg. `build_filter_complex()` also defensively discards any stored crop with
+zero width/height as a second line of defense for old `config.json` entries.
+
+## Cover (thumbnail) embedding
+
+`ProcessadorVideo._gerar_capa()` embeds a cover image as an attached-pic mjpeg stream directly inside the
+exported `.mp4` (no separate `_capa.jpg` file), extracting a frame from the middle of the video.
+
+## Windows-specific export safety
+
+`_executar_ffmpeg()` writes to a temp filename (`<stem>_tmp<suffix>`) in the output folder and only renames
+over the final destination after ffmpeg exits 0. This avoids a Windows file-lock failure when the output
+folder is the same as the input folder (reading and writing the same open file at once used to raise
+`Exception(process.stderr)` even though the video had actually been produced correctly).
