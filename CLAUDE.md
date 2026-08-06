@@ -54,7 +54,12 @@ unica diferenca real: aqui o payload publicado e o **binario `Fusex.exe` ja comp
 `.py`), porque o app depende de customtkinter/Pillow/pilmoji/ffmpeg e as maquinas de destino nao tem
 Python instalado, so o launcher.
 
-- **Repositorio**: `fraankbsb/fnkFusex` no GitHub, **privado**.
+- **Repositorio**: `fraankbsb/fnkFusex` no GitHub, **publico** (unico repositorio, criado uma vez —
+  comecou privado e foi trocado pra publico logo em seguida, nunca apagado/recriado). Precisa ser publico
+  porque o `launcher.py` consulta a API do GitHub sem autenticacao (igual ao fnkDownloader); com o repo
+  privado, `GET /repos/{repo}/releases/latest` retorna 404 mesmo pra quem tem acesso, e nao ha token
+  embutido no launcher (embutir um token no `.exe` distribuido seria extraivel por qualquer um que tivesse
+  o arquivo). Nao reverter pra privado sem resolver esse problema de autenticacao antes.
 - **`launcher.py`** → compilado em `FusexLauncher.exe` (PyInstaller `--onefile --windowed`). Tem 2 botoes:
   "Atualizar App" (baixa a release mais recente do GitHub e sobrescreve o `Fusex.exe` local) e "Iniciar App"
   (abre `Fusex.exe` direto via `subprocess.Popen`, sem precisar de python na maquina). So precisa
